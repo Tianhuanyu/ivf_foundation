@@ -1,0 +1,21 @@
+{
+  "// note": "Open /mnt/d/Video/domain_transfer via Remote-WSL; pick the 'dapt' conda interpreter.",
+  "python.defaultInterpreterPath": "~/miniconda3/envs/dapt/bin/python",
+  "files.watcherExclude": {
+    "**/frames/**": true,
+    "**/weights/**": true,
+    "**/repos/**": true,
+    "**/logs/**": true,
+    "**/manifests/**": true
+  },
+  "search.exclude": {
+    "**/frames": true,
+    "**/weights": true,
+    "**/repos": true,
+    "**/logs": true,
+    "**/manifests": true
+  },
+  "files.exclude": {
+    "**/__pycache__": true
+  }
+}

@@ -1,0 +1,22 @@
+# ---- data & artifacts (large / machine-specific; regenerate or fetch from GCS) ----
+# extracted frames        -> regenerate: scripts/11_extract_frames.py
+frames/
+# model weights & checkpoints (download / training outputs)
+weights/
+# training logs
+logs/
+# manifests contain absolute machine-local paths -> regenerate: scripts/10_build_manifest.py
+manifests/
+
+# ---- unused DINOv3 clone (DINOv3 is loaded via transformers, not this repo) ----
+repos/dinov3/
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+
+# ---- editor / OS ----
+.DS_Store

@@ -1,0 +1,7 @@
+# This project runs on Linux/WSL — keep LF line endings everywhere so shell
+# scripts don't break with CRLF (\r) when checked out on Windows.
+* text=auto eol=lf
+*.sh  text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
+*.json text eol=lf

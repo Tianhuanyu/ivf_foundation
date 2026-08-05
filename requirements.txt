@@ -1,0 +1,20 @@
+# Python deps for the domain-transfer pipeline.
+# NOTE: install torch/torchvision SEPARATELY with the CUDA build matching your GPU:
+#   Blackwell / RTX 50xx (local):  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   Ampere/Ada/Hopper (cloud VM):  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Then: pip install -r requirements.txt
+
+timm
+einops
+transformers>=4.56        # provides DINOv3 (DINOv3ViTModel) via AutoModel
+huggingface_hub
+safetensors
+decord                    # video frame reader for the V-JEPA2 clip dataset
+av
+opencv-python-headless
+pillow
+scikit-learn              # kNN / linear-probe evaluation
+umap-learn
+pandas
+pyyaml
+tqdm

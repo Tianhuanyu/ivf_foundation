@@ -226,6 +226,10 @@ uniform baseline（0.0964 > 0.0861）**。这才是把诊断落实成正向结�
 
 ## 7. 复现指南
 
+> **2026-09-26 更新**：下面的命令记录的是当时的写法。之后 7 个 yaml 合并成了一个 base（`dapt_vitb16.yaml`）加 `scripts/dapt_arms.sh` 里的覆盖项（已验证合并后的配置逐项一致），`REMOTE_SCRIPT` / `CONFIG` 环境变量也换成了 `ARM` / `BUDGET`。对应关系：
+> `..._official_compare_base/adaptive/motion/motion_weighted/motion_ibotlocal_{high,low}.yaml` → `ARM=uniform/content/motion/motion_weighted/motion_ibotlocal_{high,low} BUDGET=e1`；`dapt_vitb16.yaml`（长程）→ `ARM=uniform BUDGET=long`。
+> 现在的跑法：本地 `ARM=... BUDGET=... ./scripts/dapt_run.sh`，GCP `ARM=... BUDGET=... ./scripts/dapt_train.sh start`。
+
 ```bash
 # 1. 生成 motion-energy sidecar（原生 Windows，避免 WSL）
 C:\ProgramData\miniconda3\python.exe -u scripts\12_motion_energy.py --manifest manifests\train_videos.txt --split train --workers 4

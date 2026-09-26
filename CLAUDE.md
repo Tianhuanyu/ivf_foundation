@@ -17,7 +17,7 @@
   - `dinov3/data/datasets/frames.py`
   - `dinov3/data/masking.py`
   - `dinov3/train/ssl_meta_arch.py`
-  - `dinov3/configs/train/dapt_vitb16*.yaml`
+  - `dinov3/configs/train/dapt_vitb16.yaml`（唯一的 base config；实验臂和训练量在 `scripts/dapt_arms.sh`）
 - `scripts/`：数据准备（10–13）、GCP 编排（`dapt_train.sh`、`_gcp_*.sh`）、权重交接（`ship_weights.sh`）。
 - `legacy/`：已废弃的代码（自研 DINO、V-JEPA2、I-JEPA、fold、HF 格式评估脚本、旧日志）。不要在上面开发，也不要推荐。
 - 论文主线：DINOv3 DAPT + motion 引导采样（空间 crop 加时间帧权重）。消融臂是 uniform / content / motion / motion_weighted。CoarseFineFPN 和 ibot_local 不属于主线。
@@ -36,8 +36,9 @@
 - **不要读取、打印或移动 `keydump.txt`**：可能含凭据。
 - **在 `D:\Conceivable-SharedData01-23Jun2026` 里禁止任何 git 操作**，并遵守其 `doc/CLAUDE.md`。
 - `D:\Video\*.mp4` 原始视频只读。
-- 启动 GCP 实例或训练前先征得用户同意，这会产生费用。`REMOTE_SCRIPT` 必须显式指定。
-- torchrun 必须显式传 `--output-dir`，否则 yaml 里的 `output_dir` 会被覆盖。
+- 启动 GCP 实例或训练前先征得用户同意，这会产生费用。`ARM` 必须显式指定。
+- 训练一律通过 `scripts/dapt_run.sh`（本地）或 `scripts/dapt_train.sh`（GCP），不要直接调 torchrun。新增实验臂只改 `scripts/dapt_arms.sh`，不要复制 yaml。
+- 改了 `repos/dinov3` 之后，按 README §2 重新生成 `patches/dinov3_dapt.patch`。
 
 ## 环境
 - WSL Ubuntu-24.04，conda 环境 `dapt`，项目路径 `/mnt/d/Video/domain_transfer`。

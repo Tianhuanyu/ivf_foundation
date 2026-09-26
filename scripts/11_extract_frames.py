@@ -11,16 +11,11 @@ already has frames are skipped, so it resumes cleanly.
 """
 import argparse
 import os
-import re
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-
-def parse_stage(name: str) -> str:
-    stem = Path(name).stem
-    stage = stem.split("_MI_", 1)[1] if "_MI_" in stem else stem
-    return re.sub(r"[_\d]+$", "", stage) or "UNKNOWN"
+from _common import DT_ROOT, parse_stage, read_manifest
 
 
 def probe_duration(video: str) -> float:
@@ -68,7 +63,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True, help="train_videos.txt or val_videos.txt")
     ap.add_argument("--split", required=True, choices=["train", "val"])
-    ap.add_argument("--out", default="/mnt/d/Video/domain_transfer/frames")
+    ap.add_argument("--out", default=f"{DT_ROOT}/frames")
     ap.add_argument("--fps", type=float, default=1.0, help="frames sampled per second")
     ap.add_argument("--short", type=int, default=256, help="short-side resize (px)")
     ap.add_argument("--quality", type=int, default=3, help="ffmpeg -q:v (2=best..31)")
@@ -80,9 +75,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="only first N videos (smoke test)")
     args = ap.parse_args()
 
-    videos = [l.strip() for l in Path(args.manifest).read_text().splitlines() if l.strip()]
-    if args.limit:
-        videos = videos[: args.limit]
+    videos = read_manifest(args.manifest, args.limit)
     print(f"[{args.split}] {len(videos)} videos -> {args.out} "
           f"(fps={args.fps}, short={args.short}, workers={args.workers})")
 

@@ -48,28 +48,11 @@ import cv2
 import numpy as np
 from scipy.ndimage import maximum_filter1d
 
+from _common import DT_ROOT, SIDECAR_SUFFIX, parse_stage, read_manifest, sidecar_path, to_native_path
+
 PER_VIDEO_TIMEOUT_SEC = 180
 
 cv2.setNumThreads(0)  # avoid cv2-internal-threads + process-pool fork issues
-
-
-def to_native_path(p: str) -> str:
-    """Manifests/configs are written as WSL paths (/mnt/d/...). This script
-    also runs directly on native Windows (see README/session notes -- WSL's
-    own command-execution service turned out to be too unstable for this
-    long-running a job), where that path doesn't resolve. Translate
-    /mnt/<drive>/... -> <DRIVE>:/... only on Windows; a no-op everywhere else."""
-    if os.name == "nt":
-        m = re.match(r"^/mnt/([a-zA-Z])/(.*)", p)
-        if m:
-            return f"{m.group(1).upper()}:/{m.group(2)}"
-    return p
-
-
-def parse_stage(name: str) -> str:
-    stem = Path(name).stem
-    stage = stem.split("_MI_", 1)[1] if "_MI_" in stem else stem
-    return re.sub(r"[_\d]+$", "", stage) or "UNKNOWN"
 
 
 def resize_gray(frame_bgr, short: int):
@@ -163,8 +146,8 @@ def has_all_sidecars(kept, frame_dir: Path, sidecar_cache: dict) -> bool:
         existing = set()
         if frame_dir.is_dir():
             for f in frame_dir.iterdir():
-                if f.name.endswith(".me.png"):
-                    existing.add(f.name[: -len(".me.png")])
+                if f.name.endswith(SIDECAR_SUFFIX):
+                    existing.add(f.name[: -len(SIDECAR_SUFFIX)])
         sidecar_cache[key] = existing
     existing = sidecar_cache[key]
     return all(p.name in existing for p in kept)
@@ -176,7 +159,7 @@ def process_one(video: str, frames_root: str, split: str, out_short: int, calc_s
     video, kept = list_kept_frames(video, frames_root, split)
     if not kept:
         return (video, "no_kept_frames", 0)
-    if all(Path(str(p) + ".me.png").exists() for p in kept):
+    if all(Path(sidecar_path(p)).exists() for p in kept):
         return (video, "skip", len(kept))
 
     cap = cv2.VideoCapture(video)
@@ -284,7 +267,7 @@ def process_one(video: str, frames_root: str, split: str, out_short: int, calc_s
         window_diffs = diffs[lo_ptr:hi_ptr]
         motion = finalize_map(list(window_diffs), sigma, out_short, ceiling_mult, gamma)
         if motion is not None:
-            cv2.imwrite(str(kept[kept_idx]) + ".me.png", motion)
+            cv2.imwrite(sidecar_path(kept[kept_idx]), motion)
             written += 1
 
     status = "ok" if written == n_kept else f"partial ({written}/{n_kept})"
@@ -312,7 +295,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--split", required=True, choices=["train", "val"])
-    ap.add_argument("--frames-root", default="/mnt/d/Video/domain_transfer/frames_hires")
+    ap.add_argument("--frames-root", default=f"{DT_ROOT}/frames_hires")
     ap.add_argument("--out-short", type=int, default=96,
                     help="sidecar short-side px, must match MotionCropSampler's expectation")
     ap.add_argument("--calc-short", type=int, default=192,
@@ -348,9 +331,7 @@ def main():
     args = ap.parse_args()
     args.frames_root = to_native_path(args.frames_root)
 
-    videos = [l.strip() for l in Path(args.manifest).read_text().splitlines() if l.strip()]
-    if args.limit:
-        videos = videos[: args.limit]
+    videos = read_manifest(args.manifest, args.limit)
 
     # Cheap pre-check in the parent (no cv2/numpy import, just directory
     # listings): skip spawning a whole subprocess for videos that are already

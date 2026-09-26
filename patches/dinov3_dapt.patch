@@ -103,7 +103,7 @@ index 8002aac..021a49b 100644
    localcrops_subset_of_globalcrops: false
    share_color_jitter: false
 diff --git a/dinov3/data/augmentations.py b/dinov3/data/augmentations.py
-index 710cfd1..e5b49dc 100644
+index 710cfd1..0fa5cc0 100644
 --- a/dinov3/data/augmentations.py
 +++ b/dinov3/data/augmentations.py
 @@ -4,17 +4,45 @@
@@ -152,7 +152,7 @@ index 710cfd1..e5b49dc 100644
  class DataAugmentationDINO(object):
      def __init__(
          self,
-@@ -30,9 +58,27 @@ class DataAugmentationDINO(object):
+@@ -30,9 +58,25 @@ class DataAugmentationDINO(object):
          patch_size=16,
          share_color_jitter=False,
          horizontal_flips=True,
@@ -164,8 +164,6 @@ index 710cfd1..e5b49dc 100644
          std=IMAGENET_DEFAULT_STD,
      ):
 +        self.local_crops_native = local_crops_native
-+        self.crop_sampler_name = crop_sampler
-+        self.crop_sampler_temp = crop_sampler_temp
 +        # ibot_local: local-crop counterpart of ibot masking (see
 +        # dinov3/data/masking.py's MotionGuidedMaskingGenerator and
 +        # ssl_meta_arch.py) -- this class's job is only to hand each local
@@ -180,7 +178,7 @@ index 710cfd1..e5b49dc 100644
          self.global_crops_scale = global_crops_scale
          self.local_crops_scale = local_crops_scale
          self.local_crops_number = local_crops_number
-@@ -107,16 +153,35 @@ class DataAugmentationDINO(object):
+@@ -107,16 +151,35 @@ class DataAugmentationDINO(object):
                  interpolation=v2.InterpolationMode.BICUBIC,
              )
  
@@ -226,7 +224,7 @@ index 710cfd1..e5b49dc 100644
  
          # color distortions / blurring
          color_jittering = v2.Compose(
-@@ -218,9 +283,42 @@ class DataAugmentationDINO(object):
+@@ -218,9 +281,42 @@ class DataAugmentationDINO(object):
              output["local_crops"] = local_crops
              output["offsets"] = offsets
          else:
@@ -273,7 +271,7 @@ index 710cfd1..e5b49dc 100644
              output["offsets"] = ()
  
 diff --git a/dinov3/data/collate.py b/dinov3/data/collate.py
-index 8470008..8144474 100644
+index 8470008..c679985 100644
 --- a/dinov3/data/collate.py
 +++ b/dinov3/data/collate.py
 @@ -17,6 +17,14 @@ def collate_data_and_cast(
@@ -291,7 +289,7 @@ index 8470008..8144474 100644
  ):
      n_global_crops = len(samples_list[0][0]["global_crops"])
      n_local_crops = len(samples_list[0][0]["local_crops"])
-@@ -75,6 +83,63 @@ def collate_data_and_cast(
+@@ -75,6 +83,60 @@ def collate_data_and_cast(
      }
      if collated_gram_teacher_crops is not None:
          out["collated_gram_teacher_crops"] = collated_gram_teacher_crops.to(dtype)
@@ -320,7 +318,6 @@ index 8470008..8144474 100644
 +        N_local = local_n_tokens
 +        n_local_masked = int(B_local * local_mask_probability)
 +        local_probs = torch.linspace(*local_mask_ratio_tuple, n_local_masked + 1)
-+        local_upperbound = 0
 +        local_masks_list = [None] * B_local
 +        order = list(range(B_local))
 +        random.shuffle(order)
@@ -330,7 +327,6 @@ index 8470008..8144474 100644
 +            num_masking_patches = int(N_local * prob_max)
 +            local_mask_generator.set_saliency(local_saliency_flat[flat_idx])
 +            local_masks_list[flat_idx] = torch.BoolTensor(local_mask_generator(num_masking_patches))
-+            local_upperbound += num_masking_patches
 +        for i in range(n_local_masked, B_local):
 +            flat_idx = order[i]
 +            local_mask_generator.set_saliency(None)
@@ -347,7 +343,6 @@ index 8470008..8144474 100644
 +        out["collated_local_masks"] = collated_local_masks
 +        out["local_mask_indices_list"] = local_mask_indices_list
 +        out["local_masks_weight"] = local_masks_weight
-+        out["local_upperbound"] = local_upperbound
 +        out["n_masked_local_patches"] = torch.full(
 +            (1,), fill_value=local_mask_indices_list.shape[0], dtype=torch.long
 +        )
@@ -483,7 +478,7 @@ index 691c311..d941d38 100644
 +                break
 +        return delta
 diff --git a/dinov3/train/ssl_meta_arch.py b/dinov3/train/ssl_meta_arch.py
-index f42bed1..e31e676 100644
+index f42bed1..f2bdafc 100644
 --- a/dinov3/train/ssl_meta_arch.py
 +++ b/dinov3/train/ssl_meta_arch.py
 @@ -12,7 +12,7 @@ from omegaconf import OmegaConf
@@ -677,17 +672,16 @@ index f42bed1..e31e676 100644
          # DINO head on CLS tokens (all in one pass)
          buffer = [
              g_cls,  # [n_global_crops * B, D]
-@@ -578,6 +685,9 @@ class SSLMetaArch(nn.Module):
+@@ -578,6 +685,8 @@ class SSLMetaArch(nn.Module):
              "patch_pre_head": l_patch.unflatten(0, [n_local_crops, B]),  # [n_local_crops, B, P, D]
              "cls_after_head": buffer[1].unflatten(0, [n_local_crops, B]),  # [n_local_crops, B, K],
          }
 +        if local_mask_indices_list is not None:
 +            local_out["masked_patch_after_head"] = local_masked_patch_after_head  # [n_masked_local_patches, K]
-+            local_out["masked_patch_pre_head"] = local_masked_patches_pre_head  # [n_masked_local_patches, D]
  
          return global_out, local_out
  
-@@ -592,6 +702,10 @@ class SSLMetaArch(nn.Module):
+@@ -592,6 +701,10 @@ class SSLMetaArch(nn.Module):
          mask_indices_list,
          masks_weight,
          iteration,
@@ -698,7 +692,7 @@ index f42bed1..e31e676 100644
      ):
          n_global_crops = student_global["cls_after_head"].shape[0]
          n_local_crops = student_local["cls_after_head"].shape[0]
-@@ -648,6 +762,24 @@ class SSLMetaArch(nn.Module):
+@@ -648,6 +761,24 @@ class SSLMetaArch(nn.Module):
          loss_dict["ibot_loss"] = ibot_patch_loss
          loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
  
@@ -723,7 +717,7 @@ index f42bed1..e31e676 100644
          # Gram loss
          if self.gram_use_loss:
              gram_loss = self.gram_loss(
-@@ -756,8 +888,12 @@ class SSLMetaArch(nn.Module):
+@@ -756,8 +887,12 @@ class SSLMetaArch(nn.Module):
              local_crops_subset_of_global_crops=cfg.crops.localcrops_subset_of_globalcrops,
              share_color_jitter=cfg.crops.share_color_jitter,
              horizontal_flips=cfg.crops.horizontal_flips,
@@ -854,67 +848,86 @@ index 0000000..98b9e7c
 +    convert(a.hub, a.hf_dir, a.out)
 diff --git a/_extract_dapt_backbone_param.py b/_extract_dapt_backbone_param.py
 new file mode 100644
-index 0000000..07b0493
+index 0000000..b9e41a9
 --- /dev/null
 +++ b/_extract_dapt_backbone_param.py
-@@ -0,0 +1,30 @@
-+"""Parameterized version of _extract_dapt_backbone.py (from patches/dinov3_dapt.patch)
-+-- extracts the TEACHER backbone (EMA'd, the usual choice for downstream eval per
-+DINO/DINOv2/DINOv3 papers) from an official-trainer DCP checkpoint directory into
-+a plain state_dict .pth, directly loadable by the benchmark repo's
-+DINOv3FPN(which="dapt") via DINOV3_DAPT_B_WEIGHTS (no grayscale/fold conversion
-+needed -- this checkpoint is already standard 3-channel architecture).
+@@ -0,0 +1,42 @@
++"""Extract the TEACHER backbone (EMA'd, the usual choice for downstream eval per
++DINO/DINOv2/DINOv3 papers) from an official-trainer DCP checkpoint into a plain
++state_dict .pth, directly loadable by the benchmark repo's DINOv3FPN(which="dapt")
++via DINOV3_DAPT_B_WEIGHTS.
 +
-+  python _extract_dapt_backbone_param.py --ckpt <dir>/ckpt/2999 --out <path>.pth
++  python _extract_dapt_backbone_param.py --ckpt <out>/ckpt/2999 --out <path>.pth
++  python _extract_dapt_backbone_param.py --ckpt-root <out>/ckpt --out <path>.pth   # newest iter
 +"""
 +import argparse
++import os
++
 +import torch
 +from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 +
 +ap = argparse.ArgumentParser()
-+ap.add_argument("--ckpt", required=True)
++src = ap.add_mutually_exclusive_group(required=True)
++src.add_argument("--ckpt", help="one DCP checkpoint dir, e.g. <out>/ckpt/2999")
++src.add_argument("--ckpt-root", help="<out>/ckpt: use the highest-numbered checkpoint in it")
 +ap.add_argument("--out", required=True)
 +ap.add_argument("--tmp", default="/tmp/_extract_full.pth")
 +a = ap.parse_args()
 +
-+dcp_to_torch_save(a.ckpt, a.tmp)
++ckpt = a.ckpt
++if a.ckpt_root:
++    iters = [d for d in os.listdir(a.ckpt_root) if d.isdigit()]
++    if not iters:
++        raise SystemExit(f"no numbered checkpoints under {a.ckpt_root}")
++    ckpt = os.path.join(a.ckpt_root, max(iters, key=int))
++print("checkpoint:", ckpt)
++
++dcp_to_torch_save(ckpt, a.tmp)
 +sd = torch.load(a.tmp, map_location="cpu", weights_only=False)
++os.remove(a.tmp)
 +model_sd = sd["model"] if isinstance(sd, dict) and "model" in sd else sd
 +
 +prefixes = sorted({k.split(".backbone.")[0] + ".backbone." for k in model_sd if ".backbone." in k})
 +print("backbone prefixes found:", prefixes)
-+pref = "teacher.backbone." if any(p == "teacher.backbone." for p in prefixes) else prefixes[0]
++pref = "teacher.backbone." if "teacher.backbone." in prefixes else prefixes[0]
 +bb = {k[len(pref):]: v for k, v in model_sd.items() if k.startswith(pref)}
 +print(f"using prefix '{pref}' -> {len(bb)} backbone tensors; sample: {list(bb)[:5]}")
 +torch.save(bb, a.out)
 +print("saved DAPT backbone ->", a.out)
 diff --git a/dinov3/configs/train/dapt_vitb16.yaml b/dinov3/configs/train/dapt_vitb16.yaml
 new file mode 100644
-index 0000000..40f5268
+index 0000000..267cc12
 --- /dev/null
 +++ b/dinov3/configs/train/dapt_vitb16.yaml
-@@ -0,0 +1,46 @@
-+# Official DINOv3 DAPT (DINO+iBOT+KoLeo) — ViT-B/16, continued pretraining from released weights.
-+# Two-resolution training: global = resize (coarse whole-frame), local = NATIVE crop (fine detail).
+@@ -0,0 +1,54 @@
++# IVF-microscopy DAPT of DINOv3 ViT-B/16 (DINO+iBOT+KoLeo), continued from the released weights.
++# Two resolutions: global crops = resized whole frame (coarse), local crops = NATIVE crop (fine).
++#
++# This is the ONE base config. Experiment arms and training budgets are CLI overrides, defined in
++# ONE place: scripts/dapt_arms.sh (used by both scripts/dapt_run.sh [local] and
++# scripts/_gcp_dinov3_dapt.sh [GCP]). As written, this file = arm "uniform", budget "e1"
++# (6 x 500 = 3000 iters: 500-step warmup, then cosine decay).
++#
++# Machine-specific paths are deliberately left mandatory (???) -- the launchers pass
++# train.dataset_path / student.pretrained_weights / --output-dir.
 +MODEL:
 +  WEIGHTS: ''
 +train:
-+  dataset_path: Frames:root=/mnt/d/Video/domain_transfer/frames_hires/train
-+  batch_size_per_gpu: 16            # A100-40GB can raise; local smoke keep small
-+  OFFICIAL_EPOCH_LENGTH: 2500       # long run: epochs*this = total iters
-+  num_workers: 8
++  dataset_path: ???                  # Frames:root=<frames_hires>/train[:extra=weighted]
++  batch_size_per_gpu: 16
++  OFFICIAL_EPOCH_LENGTH: 500
++  num_workers: 4
 +  compile: false
 +  cudagraphs: false
 +  centering: sinkhorn_knopp
 +  saveckp_freq: 1
-+  output_dir: /mnt/d/Video/domain_transfer/dinov3_dapt_vitb_run
 +checkpointing:
-+  period: 2500
++  period: 500
 +  max_to_keep: 3
 +student:
 +  arch: vit_base
 +  patch_size: 16
-+  pretrained_weights: /mnt/d/Video/domain_transfer/weights/dinov3_vitb16_repo.pth
++  pretrained_weights: ???            # <weights>/dinov3_vitb16_repo.pth
 +  n_storage_tokens: 4
 +  mask_k_bias: true
 +  norm_layer: layernormbf16
@@ -931,15 +944,16 @@ index 0000000..40f5268
 +teacher:
 +  in_chans: 3
 +optim:
-+  epochs: 8                          # long run: 8 * 2500 = 20000 iters
++  epochs: 6
 +  warmup_epochs: 1
 +  freeze_last_layer_epochs: 1
 +  lr: 1.0e-04
 +crops:
 +  local_crops_number: 8
-+  global_crops_size: 224             # coarse: resized whole-frame view
-+  local_crops_size: 128             # fine: NATIVE-resolution crop (no downscale)
++  global_crops_size: 224
++  local_crops_size: 128
 +  local_crops_native: true
++  crop_sampler: uniform
 diff --git a/dinov3/configs/train/dapt_vitb16_official_compare_adaptive.yaml b/dinov3/configs/train/dapt_vitb16_official_compare_adaptive.yaml
 new file mode 100644
 index 0000000..39fd1dd
@@ -1342,10 +1356,10 @@ index 0000000..7b05680
 +  crop_sampler_temp: 0.3
 diff --git a/dinov3/data/adaptive_crop.py b/dinov3/data/adaptive_crop.py
 new file mode 100644
-index 0000000..4d2dd58
+index 0000000..7e74f01
 --- /dev/null
 +++ b/dinov3/data/adaptive_crop.py
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,162 @@
 +# Copyright (c) Meta Platforms, Inc. and affiliates.
 +#
 +# Shared low-level primitives for content-adaptive local-crop position sampling:
@@ -1372,7 +1386,6 @@ index 0000000..4d2dd58
 +
 +from __future__ import annotations
 +
-+import logging
 +import signal
 +
 +import cv2
@@ -1382,8 +1395,6 @@ index 0000000..4d2dd58
 +from torchvision.transforms import functional as TF
 +
 +cv2.setNumThreads(0)  # avoid the classic cv2-internal-threads + fork deadlock
-+
-+logger = logging.getLogger("dinov3")
 +
 +TIMEOUT_SEC = 10
 +
@@ -1511,26 +1522,6 @@ index 0000000..4d2dd58
 +    return [(int(torch.randint(0, max(1, h - size + 1), (1,)).item()),
 +             int(torch.randint(0, max(1, w - size + 1), (1,)).item()))
 +            for _ in range(n_crops)]
-+
-+
-+def adaptive_crop_positions(image, size, n_crops, temperature=0.3,
-+                             stride_frac=1 / 8, suppress_radius_frac=0.75):
-+    """Back-compat wrapper (content-only) — prefer crop_sampler.ContentCropSampler
-+    for new code. image: PIL image (any mode, e.g. RGB — cropping happens on the
-+    original image, scoring uses a grayscale view of it). Returns n_crops PIL
-+    crops of size (size,size)."""
-+    image = pad_if_needed(image, size)
-+    try:
-+        with time_limit():
-+            gray = np.array(image.convert("L"))
-+            score = content_score(gray)
-+            chosen = sample_positions_from_score(
-+                score, size, n_crops, temperature, stride_frac, suppress_radius_frac)
-+    except Exception as e:
-+        logger.warning(f"[adaptive_crop] scoring failed/timed out ({e}); "
-+                        f"falling back to uniform random crop for this image")
-+        chosen = uniform_positions(image, size, n_crops)
-+    return crop_at_positions(image, size, chosen)
 diff --git a/dinov3/data/crop_sampler.py b/dinov3/data/crop_sampler.py
 new file mode 100644
 index 0000000..22e8aef

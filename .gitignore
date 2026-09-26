@@ -32,6 +32,8 @@ legacy/
 # ---- official DINOv3 clone = the ACTIVE trainer. It has its own .git; our edits are backed up
 # (and must be kept in sync) in patches/dinov3_dapt.patch -- see README §2. ----
 repos/dinov3/
+# V-JEPA2 clone: only used by the archived legacy/ video-line scripts (was a submodule until 2026-09-26)
+repos/vjepa2/
 
 # ---- python ----
 __pycache__/

@@ -39,12 +39,13 @@ then samples.sort()) plus frame_weights_meta.json for provenance.
 import argparse
 import json
 import os
-import re
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+from _common import SIDECAR_SUFFIX, sidecar_path
 
 _EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 
@@ -56,7 +57,7 @@ def list_samples_like_frames_dataset(root: str):
     samples = []
     for dirpath, _, filenames in os.walk(root):
         for fn in filenames:
-            if fn.lower().endswith(".me.png"):
+            if fn.lower().endswith(SIDECAR_SUFFIX):
                 continue
             if fn.lower().endswith(_EXTS):
                 samples.append(os.path.join(dirpath, fn))
@@ -86,7 +87,7 @@ def main():
     scores = np.full(n, np.nan, dtype=np.float32)
     n_missing = 0
     for i, jpg_path in enumerate(samples):
-        me_path = jpg_path + ".me.png"
+        me_path = sidecar_path(jpg_path)
         me = cv2.imread(me_path, cv2.IMREAD_GRAYSCALE)
         if me is None:
             n_missing += 1

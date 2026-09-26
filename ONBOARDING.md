@@ -36,9 +36,10 @@ D:\Video\*.mp4
   │ 10_build_manifest → 11_extract_frames → 12_motion_energy → 13_frame_weights
   ▼
 frames_hires/<split>/<stage>/*.jpg (+ *.me.png 运动能量 sidecar)
-  │ repos/dinov3: torchrun dinov3/train/train.py --config-file dapt_vitb16_official_compare_*.yaml
+  │ ARM=<臂> BUDGET=<e1|long> scripts/dapt_run.sh（本地）或 scripts/dapt_train.sh（GCP）
+  │   = repos/dinov3 官方 train.py + dapt_vitb16.yaml + scripts/dapt_arms.sh 里的覆盖项
   ▼
-<output_dir>/ckpt/<iter>  →  _extract_dapt_backbone_param.py  →  *_backbone.pth
+<output_dir>/ckpt/<iter>  →  _extract_dapt_backbone_param.py（launcher 自动调用）  →  *_backbone.pth
   │ scripts/ship_weights.sh（sha256 + 登记 WEIGHTS_REGISTRY）
   ▼
 SharedData01/stage1_out/dinov3_ckpt/  →  run_benchmark_*.py  →  report.html / per-class AP
@@ -76,11 +77,11 @@ SharedData01/stage1_out/dinov3_ckpt/  →  run_benchmark_*.py  →  report.html 
 
 ### 3.2 设计维度（每个对应一个 yaml 臂，除标注的一行外其余超参完全相同）
 
-| 维度 | 臂 / config 后缀 | 改了什么 |
+| 维度 | ARM（定义在 `scripts/dapt_arms.sh`） | 改了什么 |
 |---|---|---|
-| 空间：local crop 裁在哪 | `_base`（uniform）/ `_adaptive`（content，形态学加结构张量打分）/ `_motion`（运动能量） | `crops.crop_sampler` |
-| 时间：哪一帧多看 | `_motion_weighted` | `dataset_path: ...:extra=weighted`，帧权重为 p90 运动分数的 γ=0.4 次方 |
-| 预训练目标 | `_motion_ibotlocal_high` / `_low` | 在 local crop 上做运动显著性引导的掩码预测（`ibot_local:` 段） |
+| 空间：local crop 裁在哪 | `uniform` / `content`（形态学加结构张量打分）/ `motion`（运动能量） | `crops.crop_sampler` |
+| 时间：哪一帧多看 | `motion_weighted` | `dataset_path: ...:extra=weighted`，帧权重为 p90 运动分数的 γ=0.4 次方 |
+| 预训练目标 | `motion_ibotlocal_high` / `_low` | 在 local crop 上做运动显著性引导的掩码预测（`ibot_local:` 段） |
 | 下游架构 | benchmark 侧 `--coarse-fine --cf-fuse xattn` | 高分辨率切块加交叉注意力，针对 patch 分辨率瓶颈 |
 
 ---
@@ -133,9 +134,11 @@ SharedData01/stage1_out/dinov3_ckpt/  →  run_benchmark_*.py  →  report.html 
   ```
 - **例外**：motion-energy 生成在**原生 Windows** 上跑（`C:\ProgramData\miniconda3\python.exe`），WSL 下有问题，原因见 SESSION_NOTES §2.3。
 - **完整复现命令**：SESSION_NOTES §7（抽帧 → sidecar → 训练 → 抽 backbone → benchmark）。
-- **GCP**（项目 `hidden-outrider-390502`，实例 `dapt-a100`）：README §5。
+- **本地训练**：`ARM=<臂> BUDGET=e1 ./scripts/dapt_run.sh`（README §2）。
+- **GCP**（项目 `hidden-outrider-390502`，实例 `dapt-a100`）：README §3。
   ```bash
-  REMOTE_SCRIPT=_gcp_dinov3_dapt.sh CONFIG=<yaml> ./scripts/dapt_train.sh start|status|finish
+  ./scripts/dapt_prep.sh run                                     # 一次性：帧缓存
+  ARM=<臂> BUDGET=long ./scripts/dapt_train.sh start|status|finish
   ```
 - **权重交接**：`./scripts/ship_weights.sh <权重> <benchmark侧路径> "<来源>" "<配置>"`，不要手动 `cp`。
 
@@ -143,8 +146,9 @@ SharedData01/stage1_out/dinov3_ckpt/  →  run_benchmark_*.py  →  report.html 
 
 ## 7. 踩过的坑（接手时最容易重踩的）
 
-- **`--output-dir` 必须在 torchrun 命令行显式传入**，否则 yaml 里的 `output_dir` 会被 CLI 默认值 `./local_dino` 覆盖。
-- **`REMOTE_SCRIPT` 没有默认值**，不传会直接报错。这是故意的，之前误跑旧脚本白烧过 GCP 账单。
+- **不要绕过 launcher 直接调 torchrun**：`dapt_vitb16.yaml` 里的数据路径和权重路径故意留成必填项（`???`），`--output-dir` 也必须显式传，否则会落到默认的 `./local_dino`。`dapt_run.sh` / `_gcp_dinov3_dapt.sh` 已经处理了这些。
+- **`ARM` 没有默认值**，不传会直接报错。这是故意的，之前误跑错误的实验白烧过 GCP 账单。
+- **桶里现有的帧缓存 sidecar 不全**（2026-09-26 之前做的）。跑 motion 类 ARM 之前先删掉它，用 `dapt_prep.sh run` 重做。
 - **GCP zone 会变**：A100 缺货时会自动换 zone，实际 zone 以 `.dapt_a100_zone` 为准。
 - **GCP OS Login 账户会漂移**：可能是 `thy`，也可能是 `htian_conceivable_life`，两者 `$HOME` 独立，换账户会触发重装环境。
 - **本地长跑务必定期存 checkpoint**：WSL 意外重启丢过训练进度。
@@ -156,7 +160,7 @@ SharedData01/stage1_out/dinov3_ckpt/  →  run_benchmark_*.py  →  report.html 
 
 ## 8. 交接前需要原负责人处理 ⚠️
 
-- [ ] **本仓库大量工作未提交**：只有 1 个 commit（`271895c`）。`12_motion_energy.py`、`13_frame_weights.py`、GCP 脚本、`ship_weights.sh`、`patches/`、SESSION_NOTES 都是 untracked，另有 7 个已跟踪文件有修改。需要 commit 并 push 到 `Tianhuanyu/ivf_foundation`。
+- [ ] **push**：交接相关的改动已经提交在分支 `handoff-cleanup` 上，还没有合回 main、也没有 push 到 `Tianhuanyu/ivf_foundation`。
 - [ ] **`repos/dinov3` 的改动只存在于工作区和 `patches/dinov3_dapt.patch`**：已核对 patch 与当前改动一致（2026-09-22）。建议在一个 fork 上提交成分支，至少把 patch 随本仓库一起提交。
 - [ ] **仓库根目录的 `keydump.txt`**：已 gitignore，但文件名暗示含凭据。交接前确认内容，必要时轮换密钥并删除，**不要把它转交给别人**。
 - [ ] **访问权限**：

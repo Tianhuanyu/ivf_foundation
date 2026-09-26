@@ -99,6 +99,7 @@ def exp_status():
     abl_runs = runs_in(RES_ABL_DIR)
     rows = []
 
+    # (single training seed + test-set bootstrap CIs -- contract amendment A3; SEEDS = runner.SEEDS = [42])
     # E1 — DAPT pretraining of every arm at the same budget
     missing = [a for a in ABLATION_ARMS if arm_weights(a) is None]
     cmds = []
@@ -128,7 +129,7 @@ def exp_status():
         done += n
         if n < len(ALL_DATASETS) * 2 * len(SEEDS):
             cmds.append(f"{env}python run_benchmark_server.py --all-seeds --backbone {bb} --skip-done")
-    rows.append(("E2", "main benchmark: 6 backbones x 9 datasets x 2 protocols x 3 seeds (detect 1024 px)", done, total,
+    rows.append(("E2", "main benchmark: 6 backbones x 9 datasets x 2 protocols x seed 42 (detect 1024 px)", done, total,
                  [f"cd {to_posix(BENCH)}", "# measure one 1024-px detection run first"] + cmds if cmds else [],
                  f"benchmark repo; >{MIN_PER_BENCH_RUN_320 * (total - done) / 60:.0f} GPU-h left (lower bound, 1024 px not measured)"))
 
@@ -145,7 +146,7 @@ def exp_status():
         if n < per_arm:
             cmds.append(f"DINOV3_DAPT_B_WEIGHTS={to_posix(w)} python run_benchmark_server.py --all-seeds "
                         f"--backbone dinov3_dapt_b_fpn --protocol frozen --skip-done")
-    rows.append(("E3", f"ablation: DAPT arms x 9 datasets x frozen x 3 seeds", done, per_arm * len(ABLATION_ARMS),
+    rows.append(("E3", f"ablation: DAPT arms x 9 datasets x frozen x seed 42", done, per_arm * len(ABLATION_ARMS),
                  [f"cd {to_posix(BENCH)}"] + cmds if cmds else [], "main-arm frozen runs are shared with E2"))
 
     # E4 — resolution (claim C3): the main table's detection runs again at 320 px
@@ -166,7 +167,7 @@ def exp_status():
         done += n
         if n < per_bb:
             cmds.append(f"{env}{base} --backbone {bb}")
-    rows.append(("E4", f"resolution ablation: 4 backbones x {len(RES_ABL['datasets'])} detect datasets x frozen x 3 seeds @ {RES_ABL['imgsz']} px",
+    rows.append(("E4", f"resolution ablation: 4 backbones x {len(RES_ABL['datasets'])} detect datasets x frozen x seed 42 @ {RES_ABL['imgsz']} px",
                  done, per_bb * len(RES_ABL["backbones"]),
                  [f"cd {to_posix(BENCH)}"] + cmds if cmds else [],
                  "+ `paper.py tokens` (local) + verify_v2_perclass_ap.py per run for per-class AP"))
@@ -238,88 +239,90 @@ def cmd_tokens(_):
 
 
 # ── paper tables ─────────────────────────────────────────────────────────────────────────────
-def _table(agg, datasets, columns, header_names, title):
-    out = [f"### {title}", "", "| dataset (metric) | " + " | ".join(header_names) + " |",
-           "|---|" + "---|" * len(columns)]
+def _table(agg, proto, datasets, columns, header_names, title, extra=None):
+    """agg: {(proto, ds): {col: Stat}}; extra: optional (header, fn(ds) -> str) appended column."""
+    hdr = ["dataset (metric)"] + header_names + ([extra[0]] if extra else [])
+    out = [f"### {title}", "", "| " + " | ".join(hdr) + " |", "|---" * len(hdr) + "|"]
     for ds, task in datasets:
-        row = agg.get(ds, {})
+        row = agg.get((proto, ds), {})
         best = max((row[c].mean for c in columns if c in row), default=None)
-        cells = []
-        for c in columns:
-            s = row.get(c)
-            cells.append("—" if s is None else (f"**{s.fmt()}**" if s.mean == best else s.fmt()))
+        cells = ["—" if c not in row else (f"**{row[c].fmt()}**" if row[c].mean == best else row[c].fmt())
+                 for c in columns]
+        if extra:
+            cells.append(extra[1](ds))
         out.append(f"| {ds} ({rc.METRIC_LABEL[rc.HEADLINE[task]]}) | " + " | ".join(cells) + " |")
     return out + [""]
 
 
-def _agg_by(runs, key):
-    """{dataset: {key(run): Stat}} over seeds (headline metric)."""
-    vals = defaultdict(lambda: defaultdict(dict))
-    for r in runs:
-        v = rc.metric_of(r)
-        if v is not None and r.seed in SEEDS:
-            vals[r.dataset][key(r)][r.seed] = v
-    out = {}
-    for ds, per in vals.items():
-        out[ds] = {}
-        for k, by_seed in per.items():
-            xs = list(by_seed.values())
-            out[ds][k] = rc.Stat(statistics.mean(xs), statistics.stdev(xs) if len(xs) > 1 else 0.0, len(xs), sorted(by_seed))
-    return out
+def _delta_summary(deltas):
+    ds = [d for d in deltas if d]
+    if not ds:
+        return "—"
+    above = sum(d[1] is not None and d[1] > 0 for d in ds)
+    return f"better on {sum(d[0] > 0 for d in ds)}/{len(ds)}, CI>0 on {above}/{len(ds)}, mean Δ {sum(d[0] for d in ds) / len(ds):+.3f}"
 
 
 def cmd_tables(_):
     OUT.mkdir(parents=True, exist_ok=True)
-    main_runs = [r for r in runs_in(runner.OUTDIR) if r.dataset not in rc.DROP]
+    main_runs = [r for r in runs_in(runner.OUTDIR) if r.dataset not in rc.DROP and r.seed in SEEDS]
     task = rc.task_of(main_runs)
     arm_sha = {a: sha256(arm_weights(a)) for a in ABLATION_ARMS if arm_weights(a)}
     sha_arm = {v: k for k, v in arm_sha.items()}
-    md = ["# Paper tables (generated by experiments/paper.py tables)", "",
-          f"Test-set headline metric, mean ± std over seeds {SEEDS}; bold = best in row; (n=k) = fewer than 3 seeds done. "
-          f"Excluded datasets: {', '.join(rc.DROP)}. Locked split (contract amendment A1).", ""]
-
-    # T1 main (C1): "ours" = MAIN_ARM checkpoint
     ours_sha = arm_sha.get(MAIN_ARM)
-    def main_key(r):
+    md = ["# Paper tables (generated by experiments/paper.py tables)", "",
+          f"Test-set headline metric, seed {SEEDS}. Single seed: value [test-set bootstrap 95% CI, 1000 resamples]; "
+          "Δ columns: paired bootstrap on the same test images, * = CI excludes 0 (contract amendment A3). "
+          f"Bold = best in row. Excluded datasets: {', '.join(rc.DROP)}. Locked split (A1); detection at 1024 px (A2).", ""]
+
+    def bb_key(r):                                        # DAPT runs count only for the MAIN_ARM checkpoint
         if r.backbone == "dinov3_dapt_b_fpn":
             return "ours" if r.weights_sha256 == ours_sha else None
         return r.backbone
-    t1 = [r for r in main_runs if main_key(r)]
+
+    # T1 main (C1)
     cols = [b if b != "dinov3_dapt_b_fpn" else "ours" for b in MAIN_BACKBONES]
     names = [rc.display_name(b) if b != "ours" else f"DINOv3-DAPT ({MAIN_ARM})" for b in cols]
+    agg, idx = rc.aggregate(main_runs, key=bb_key), rc.index_runs(main_runs, key=bb_key)
     for proto in ("frozen", "finetune"):
-        agg = _agg_by([r for r in t1 if r.protocol == proto], main_key)
-        dss = [(d, task[d]) for d in rc.ordered_datasets(agg)]
-        md += _table(agg, dss, cols, names, f"T1 — main benchmark, {proto}")
+        dss = [(d, task[d]) for d in rc.ordered_datasets(d for p, d in agg if p == proto)]
+        cmp = {d: rc.compare(idx, proto, d, "ours", "dinov3_b_fpn") for d, _ in dss}
+        md += _table(agg, proto, dss, cols, names, f"T1 — main benchmark, {proto}",
+                     extra=("ours − DINOv3-raw", lambda d: rc.fmt_delta(cmp[d])))
+        md += [f"ours vs DINOv3-raw ({proto}): {_delta_summary(cmp.values())}", ""]
 
-    # T2 ablation (C2): arms, frozen
+    # T2 ablation (C2): arms, frozen, paired Δ vs uniform
     t2 = [r for r in main_runs if r.backbone == "dinov3_dapt_b_fpn" and r.protocol == "frozen" and r.weights_sha256 in sha_arm]
-    agg = _agg_by(t2, lambda r: sha_arm[r.weights_sha256])
-    dss = [(d, task[d]) for d in rc.ordered_datasets(agg)]
-    md += _table(agg, dss, ABLATION_ARMS, ABLATION_ARMS, f"T2 — DAPT sampling ablation (frozen, BUDGET={BUDGET})")
+    arm_key = lambda r: sha_arm.get(r.weights_sha256)
+    agg2, idx2 = rc.aggregate(t2, key=arm_key), rc.index_runs(t2, key=arm_key)
+    dss = [(d, task[d]) for d in rc.ordered_datasets(d for p, d in agg2)]
+    md += _table(agg2, "frozen", dss, ABLATION_ARMS, ABLATION_ARMS, f"T2 — DAPT sampling ablation (frozen, BUDGET={BUDGET})")
     if "uniform" in arm_sha:
-        md += ["| Δ vs uniform (datasets better / mean Δ) | " + " | ".join(
-            (lambda ds: f"{sum(d > 0 for d in ds)}/{len(ds)}, {statistics.mean(ds):+.3f}" if ds else "—")(
-                [agg[d][a].mean - agg[d]["uniform"].mean for d, _ in dss if a in agg[d] and "uniform" in agg[d]])
-            for a in ABLATION_ARMS) + " |", ""]
+        others = [a for a in ABLATION_ARMS if a != "uniform"]
+        md += ["| dataset | " + " | ".join(f"{a} − uniform" for a in others) + " |", "|---" * (len(others) + 1) + "|"]
+        summ = {a: [] for a in others}
+        for d, _ in dss:
+            cells = []
+            for a in others:
+                c = rc.compare(idx2, "frozen", d, a, "uniform")
+                summ[a].append(c)
+                cells.append(rc.fmt_delta(c))
+            md.append(f"| {d} | " + " | ".join(cells) + " |")
+        md += ["| **summary** | " + " | ".join(_delta_summary(summ[a]) for a in others) + " |", ""]
 
     # T3 resolution (C3): 320 px (E4 ablation) vs 1024 px (main table), frozen, detect datasets
-    abl = runs_in(RES_ABL_DIR)
-    def res_key(r):
-        if r.backbone == "dinov3_dapt_b_fpn":
-            return "ours" if r.weights_sha256 == ours_sha else None
-        return r.backbone
     cols3 = [b if b != "dinov3_dapt_b_fpn" else "ours" for b in RES_ABL["backbones"]]
-    lo = _agg_by([r for r in abl if r.protocol == "frozen" and r.dataset in RES_ABL["datasets"] and res_key(r) in cols3], res_key)
-    hh = _agg_by([r for r in main_runs if r.protocol == "frozen" and r.dataset in RES_ABL["datasets"] and res_key(r) in cols3], res_key)
-    md += ["### T3 — input resolution (frozen, detection mAP50): 320 px → 1024 px", "",
+    sel = lambda runs: [r for r in runs if r.protocol == "frozen" and r.dataset in RES_ABL["datasets"] and bb_key(r) in cols3]
+    lo = rc.aggregate(sel(runs_in(RES_ABL_DIR)), key=bb_key)
+    hh = rc.aggregate(sel(main_runs), key=bb_key)
+    md += ["### T3 — detection input resolution (frozen, mAP50): 320 px → 1024 px", "",
            "| dataset | " + " | ".join(rc.display_name(c) if c != "ours" else "ours" for c in cols3) + " |",
-           "|---|" + "---|" * len(cols3)]
+           "|---" * (len(cols3) + 1) + "|"]
     for ds in RES_ABL["datasets"]:
         cells = []
         for c in cols3:
-            a, b = lo.get(ds, {}).get(c), hh.get(ds, {}).get(c)
-            cells.append(f"{a.mean:.3f} → {b.mean:.3f}" if a and b else (f"{a.mean:.3f} → —" if a else "—"))
+            a, b = lo.get(("frozen", ds), {}).get(c), hh.get(("frozen", ds), {}).get(c)
+            cells.append(f"{a.mean:.3f} → {b.mean:.3f} ({b.mean - a.mean:+.3f})" if a and b
+                         else (f"{a.mean:.3f} → —" if a else (f"— → {b.mean:.3f}" if b else "—")))
         md.append(f"| {ds} | " + " | ".join(cells) + " |")
     md.append("")
     if (OUT / "table_tokens.md").is_file():

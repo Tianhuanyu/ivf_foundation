@@ -12,9 +12,9 @@
 
 | # | 主张 | 验证实验 | 产出 |
 |---|---|---|---|
-| **C1** | 通用基础模型在 IVF 显微域不会自动胜出；在域内视频上做 DAPT 可以稳定提升 DINOv3，并缩小或反转它与 ImageNet CNN 的差距 | **E2** 主 benchmark：6 个 backbone × 9 个数据集 × frozen/finetune × 3 seed，锁定 split，检测用 1024 px（契约修订 A2） | 表 T1 |
-| **C2**（方法） | 运动引导采样（空间 crop 加时间帧权重）优于均匀采样，也优于不用运动的显著性采样（content） | **E1** 在同一训练预算下训练 4 个 DAPT 臂，然后 **E3** 在所有数据集上跑 frozen，每组 3 seed | 表 T2 |
-| **C3**（分析） | 小目标检测的瓶颈在 ViT 的 tokenization：目标短边不到 1–2 个 token 时，任何预训练改进都救不回来；把检测输入从 320 提到 1024 px，ViT 的收益明显大于 CNN | **E4** 把主表的检测降到 320 px 重跑（4 个 backbone × 4 个检测集 × frozen × 3 seed），和主表的 1024 px 对比；加上 `tokens` 分析和逐类别 AP | 表 T3、表 tokens |
+| **C1** | 通用基础模型在 IVF 显微域不会自动胜出；在域内视频上做 DAPT 可以稳定提升 DINOv3，并缩小或反转它与 ImageNet CNN 的差距 | **E2** 主 benchmark：6 个 backbone × 9 个数据集 × frozen/finetune，单 seed 加 test 集 bootstrap 置信区间（契约修订 A3），锁定 split，检测用 1024 px（A2） | 表 T1 |
+| **C2**（方法） | 运动引导采样（空间 crop 加时间帧权重）优于均匀采样，也优于不用运动的显著性采样（content） | **E1** 在同一训练预算下训练 4 个 DAPT 臂，然后 **E3** 在所有数据集上跑 frozen（单 seed），用配对 bootstrap 和 uniform 比较 | 表 T2 |
+| **C3**（分析） | 小目标检测的瓶颈在 ViT 的 tokenization：目标短边不到 1–2 个 token 时，任何预训练改进都救不回来；把检测输入从 320 提到 1024 px，ViT 的收益明显大于 CNN | **E4** 把主表的检测降到 320 px 重跑（4 个 backbone × 4 个检测集 × frozen，单 seed），和主表的 1024 px 对比；加上 `tokens` 分析和逐类别 AP | 表 T3、表 tokens |
 | 附录 | 改训练目标（ibot_local：运动引导的 local crop 掩码预测）不如改采样；CoarseFineFPN 属于探索性结果 | E5（可选） | — |
 
 **数据与基准**本身也是贡献：约 2925 段 IVF 显微操作视频用于 DAPT；9 个显微检测、分割、分类数据集，并提供按"录制 + 近重复帧"分组的无泄漏 split。
@@ -31,9 +31,12 @@
 
 结果出来之前先写死，防止事后挑选。
 
-- **C2 成立**的条件：在 6 个主数据集的 frozen 结果上，`motion_weighted` 相对 `uniform` 在 **≥ 4/6** 个数据集上更好，平均 Δ > 0，并且在多数数据集上差值超过两者 seed 标准差之和。同时 `motion_weighted` 或 `motion` 的平均值要高于 `content`。
+**统计方式**（契约修订 A3）：每个配置只训练 1 个 seed。单个结果报告 test 集 bootstrap 的 95% 置信区间（1000 次重采样）。两个模型比较时用**配对 bootstrap**：两者在同一批重采样图片上算差值 Δ，报告 Δ 的 95% 置信区间。
+
+- **C2 成立**的条件：在 6 个主数据集的 frozen 结果上，`motion_weighted − uniform` 的配对 Δ 在 **≥ 4/6** 个数据集上为正，平均 Δ > 0，并且至少 **3/6** 个数据集的 95% 置信区间完全在 0 以上。同时 `motion_weighted` 或 `motion` 相对 `uniform` 的平均 Δ 要大于 `content` 的。
+  - **补 seed 的条件**：如果正向数据集达到 4/6，但置信区间在 0 以上的不足 3 个（方向对但不确定），只给 `uniform` 和 `motion_weighted` 这一对补 seed 43、44，再按均值判定。
   - **不成立时的降级方案**：论文改为"benchmark + C3 分析"，C2 作为阴性消融如实报告。
-- **C1 成立**的条件：ours（`motion_weighted`）相对 DINOv3-raw 在两个协议下都能在多数数据集上胜出。它和 CNN 的相对位置如实报告，不作为 C1 的成立条件。
+- **C1 成立**的条件：ours（`motion_weighted`）相对 DINOv3-raw 的配对 Δ，在两个协议下都在多数数据集上为正，且其中多数的置信区间在 0 以上。它和 CNN 的相对位置如实报告，不作为 C1 的成立条件。
 - **C3 成立**的条件：从 320 px 到 1024 px，ViT 类 backbone 在"短边不到 2 个 token"的检测集上，mAP 提升大于 CNN 的提升。并且逐类别来看，越小的类别（needle_tip、oocyte_4x、cell）提升越大。
 
 ## 已经可以确定的事实（不依赖待跑实验）
@@ -43,6 +46,8 @@
 
 ## 已做的决定
 
+0. **单 seed 加 test 集 bootstrap 置信区间**（2026-09-26，契约修订 A3）。DAPT 预训练和下游 benchmark 都只跑 seed 42；依据是医学影像领域普遍只跑单次训练，但必须报告不确定度（Christodoulou et al., MICCAI 2024）。只有关键对比结论不确定时才补 seed（见判定规则）。论文里要写明：不确定度只反映 test 集的抽样波动，不包括训练随机性。
+
 1. **检测主表使用 1024 px**（2026-09-26，方案 B，写入契约修订 A2）。
    - 理由：320 px 下关键目标不足 1 个 token，这在结构上对所有 ViT 不利，比较的就不再是表征质量。
    - 320 px 保留为分辨率消融（E4），用来支撑 C3。
@@ -50,7 +55,6 @@
 
 ## 仍待决定
 
-1. **DAPT 预训练每个臂只跑 1 个 seed**，下游 benchmark 跑 3 个 seed。这是常见做法，要作为局限写进论文。
 2. **实验规模与算力预算**：E1 到 E3 的规模还没定，暂缓执行。主要可缩减项：DAPT 训练量（e1 或 long）、是否包含 3 个不进主表的数据集、是否保留 DINOv2-S。
 
 ## 执行顺序与算力
@@ -64,9 +68,9 @@ python experiments/paper.py commands      # 缺什么就给出对应的命令（
 |---|---|---|
 | 0 | 重做帧缓存（旧缓存的 sidecar 不全）：`dapt_prep.sh run` | CPU 机，数小时 |
 | E1 | 4 个 DAPT 臂 × BUDGET=long（20000 iter） | 每臂约 16–17 A100 小时（按 e1 实测 1.0 s/it @ batch16 推算，第一个臂跑完后校准） |
-| E2 | 324 个 run，检测用 1024 px | 至少 27 A100 小时（320 px 实测约 5 分钟/run；1024 px 更慢，先测速） |
-| E3 | 108 个 run，其中 main 臂的 27 个与 E2 共用 | 约 7 A100 小时 |
-| E4 | 48 个 run，320 px | 约 4 A100 小时 |
+| E2 | 108 个 run，检测用 1024 px | 至少 9 A100 小时（320 px 实测约 5 分钟/run；1024 px 更慢，先测速） |
+| E3 | 36 个 run，其中 main 臂的 9 个与 E2 共用 | 约 2–3 A100 小时 |
+| E4 | 16 个 run，320 px | 约 1.5 A100 小时 |
 | 出表 | `paper.py tokens`、`paper.py tables` → `experiments/out/` | 本地，几分钟 |
 
 ## 威胁效度与对应措施
@@ -75,7 +79,7 @@ python experiments/paper.py commands      # 缺什么就给出对应的命令（
 |---|---|
 | split 泄漏或近重复 | 按录制加近重复帧分组的锁定 split，并有 dHash 验证（契约修订 A1） |
 | 不同权重的结果互相覆盖 | benchmark 的 run_id 带权重 sha，报告按权重区分变体（`weights_id.py`、`report_common.py`） |
-| 只挑有利的 seed 或指标 | 固定 3 seed，报告均值 ± 标准差；每个任务的主指标固定（Acc / mIoU / mAP50），判定规则预先登记 |
+| 只挑有利的 seed 或指标 | 固定 seed 42；报告 bootstrap 置信区间，比较用配对 bootstrap；每个任务的主指标固定（Acc / mIoU / mAP50），判定规则和补 seed 的条件预先登记 |
 | 跨协议比较（旧 E1 的教训） | 所有臂同一训练预算、同一 benchmark 协议；`paper.py` 按权重 sha 选取结果 |
 | 评测集太小 | egg_in_well、sperm_needle、routine3_coc 不进主表（`report_common.DROP`，理由写在代码里） |
 | BiomedCLIP 固定 224 px | 已在契约中预先登记为局限；E4 不纳入 BiomedCLIP |

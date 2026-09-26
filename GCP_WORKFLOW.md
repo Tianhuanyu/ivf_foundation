@@ -34,19 +34,28 @@ cat smoke_out/SUMMARY.txt
 ```
 ⛔ 全部 PASS 才继续。
 
-## 2. 重做帧缓存（CPU 机，数小时）
+## 2. 上传帧缓存（直接用本地已处理好的帧，不用开 CPU 机）
 
+本地 `frames_hires/train` 里已经有抽好的帧（86.8 万张）、运动能量图（61.7 万个 `.me.png`）和 `frame_weights.npy`，和本地冒烟、训练用的是同一份数据。直接同步到桶，中断后重新执行同一条命令会接着传：
+```bash
+cd /mnt/d/Video/domain_transfer
+```
+```bash
+gcloud storage rsync -r frames_hires/train gs://mlflow-artifacts-ai-a100/dapt/cache/frames_hires/train
+```
+⛔ 检查帧权重已上传：
+```bash
+gcloud storage ls -l gs://mlflow-artifacts-ai-a100/dapt/cache/frames_hires/train/frame_weights.npy
+```
+⛔ 检查帧数应该是 868310：
+```bash
+gcloud storage ls "gs://mlflow-artifacts-ai-a100/dapt/cache/frames_hires/train/**" | grep -c "\.jpg$"
+```
+删掉旧的打包缓存（它缺运动图；训练 VM 会优先用上面的目录，删掉是为了避免混淆）：
 ```bash
 gcloud storage rm gs://mlflow-artifacts-ai-a100/dapt/cache/frames_hires.tar
 ```
-会问是否创建实例，输入 `y`：
-```bash
-./scripts/dapt_prep.sh run
-```
-⛔ sidecar 数应该约占帧数的 70%：
-```bash
-gcloud storage cat gs://mlflow-artifacts-ai-a100/dapt/cache/PREP_DONE.txt
-```
+> 备用方案：`./scripts/dapt_prep.sh run` 会在 CPU 机上从原始视频重新生成打包缓存（数小时）。只有本地帧丢失时才需要。
 
 ## 3. E0：ViT 对 CNN
 

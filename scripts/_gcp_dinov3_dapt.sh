@@ -27,10 +27,18 @@ dapt_overrides "$ARM" "$BUDGET" "$FRAMES" "$DT_ROOT/weights/$REPO_WEIGHTS" >/dev
 echo "===== [1/5] 拉权重 + 帧缓存(代码已由 cmd_pushcode 用 scp 送到 $DT_ROOT) ====="
 [ -d "$DT_ROOT/scripts" ] || { echo "!! $DT_ROOT/scripts 不存在——请先本地 ./scripts/dapt_train.sh pushcode"; exit 1; }
 gcloud storage rsync -r "$BUCKET/dapt/domain_transfer/weights" "$DT_ROOT/weights"
-gcloud storage ls "$BUCKET/dapt/cache/frames_hires.tar" >/dev/null 2>&1 \
-  || { echo "!! 没有帧缓存,请先本地跑 ./scripts/dapt_prep.sh run"; exit 1; }
-gcloud storage cp "$BUCKET/dapt/cache/frames_hires.tar" /tmp/f.tar
-tar -C "$DT_ROOT" -xf /tmp/f.tar && rm -f /tmp/f.tar
+# 帧缓存两种形式,优先目录:
+#   dapt/cache/frames_hires/train/   本地 frames_hires/train 直接 rsync 上去(含 .me.png 和 frame_weights.npy)
+#   dapt/cache/frames_hires.tar      dapt_prep.sh 在 CPU 机上从视频重新制作的打包缓存(备用)
+if gcloud storage ls "$BUCKET/dapt/cache/frames_hires/train/frame_weights.npy" >/dev/null 2>&1; then
+  mkdir -p "$FRAMES"
+  gcloud storage rsync -r "$BUCKET/dapt/cache/frames_hires/train" "$FRAMES"
+elif gcloud storage ls "$BUCKET/dapt/cache/frames_hires.tar" >/dev/null 2>&1; then
+  gcloud storage cp "$BUCKET/dapt/cache/frames_hires.tar" /tmp/f.tar
+  tar -C "$DT_ROOT" -xf /tmp/f.tar && rm -f /tmp/f.tar
+else
+  echo "!! 桶里没有帧缓存:先把本地 frames_hires/train rsync 到 $BUCKET/dapt/cache/frames_hires/train(GCP_WORKFLOW.md 第 2 步)"; exit 1
+fi
 
 N_JPG=$(find "$FRAMES" -name '*.jpg' | wc -l)
 echo "帧数: $N_JPG"

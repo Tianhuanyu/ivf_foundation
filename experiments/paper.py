@@ -3,6 +3,7 @@
 
   python experiments/paper.py status              # what's done / missing for every experiment
   python experiments/paper.py commands [E1 E2..]  # exact commands (in order) for what's still missing
+  python experiments/paper.py commands --gcp E0   # same, benchmark steps as BENCH_CMD for bench_gcp.sh
   python experiments/paper.py tokens              # C3 analysis: object size in ViT tokens (cheap, local)
   python experiments/paper.py tables              # paper tables (markdown) -> experiments/out/
 
@@ -68,7 +69,27 @@ def arm_weights(arm: str):
     for d in (DT / "weights", DT / "gcp_outputs"):
         if (d / name).is_file():
             return d / name
-    return None
+    shipped = BENCH / shipped_rel(arm)
+    return shipped if shipped.is_file() else None
+
+
+def shipped_rel(arm: str) -> str:
+    """Where an arm's backbone lives on the BENCHMARK side (relative to the benchmark root, so the same
+    path works locally and on the GCP bench VM, whose ~/proj mirrors the benchmark root)."""
+    return f"stage1_out/dinov3_ckpt/dinov3_vitb16_dapt_{arm}_{BUDGET}.pth"
+
+
+def dapt_env(arm: str, w: Path):
+    """-> (env prefix for benchmark commands, [commands to run first]). Benchmark commands always point at
+    the shipped copy; if it isn't there yet, the ship_weights.sh step (training repo, WSL) comes first."""
+    rel = shipped_rel(arm)
+    pre = []
+    if not (BENCH / rel).is_file():
+        pre = [f"# 先把 {arm} 的权重交给 benchmark(训练仓库根目录,WSL):",
+               f"#   ./scripts/ship_weights.sh {to_posix(w)} {to_posix(BENCH / rel)} "
+               f"\"domain_transfer@$(git rev-parse --short HEAD), ARM={arm} BUDGET={BUDGET}\" "
+               f"\"ViT-B/16, dapt_vitb16.yaml + dapt_arms.sh {arm}/{BUDGET}\""]
+    return f"DINOV3_DAPT_B_WEIGHTS={rel} ", pre
 
 
 _sha_cache = {}
@@ -121,8 +142,7 @@ def exp_status():
                   shipped_sha if bb == "dinov3_dapt_b_fpn" else None)
         done += n
         if n < per_bb:
-            env = f"DINOV3_DAPT_B_WEIGHTS={to_posix(Path(shipped_path))} " if bb == "dinov3_dapt_b_fpn" else ""
-            cmds.append(f"{env}{base} --backbone {bb}")
+            cmds.append(f"{base} --backbone {bb}")          # dinov3_dapt_b_fpn = default shipped weights
     rows.append(("E0", f"auxiliary ViT-vs-CNN check on held-out days/cases: {len(E0['backbones'])} backbones x "
                        f"{len(E0['datasets'])} datasets x 2 protocols (shipped DAPT weights {shipped_sha[:8]})",
                  done, per_bb * len(E0["backbones"]),
@@ -153,7 +173,8 @@ def exp_status():
                 cmds.append(f"# {bb}: waiting for E1 ({MAIN_ARM})")
                 continue
             n = count(main_runs, bb, sha256(main_w))
-            env = f"DINOV3_DAPT_B_WEIGHTS={to_posix(main_w)} "
+            env, pre = dapt_env(MAIN_ARM, main_w)
+            cmds += pre if n < len(ALL_DATASETS) * 2 * len(SEEDS) else []
         else:
             n, env = count(main_runs, bb), ""
         done += n
@@ -174,8 +195,9 @@ def exp_status():
         n = count(main_runs, "dinov3_dapt_b_fpn", sha256(w), protocols={"frozen"})
         done += n
         if n < per_arm:
-            cmds.append(f"DINOV3_DAPT_B_WEIGHTS={to_posix(w)} python run_benchmark_server.py --all-seeds "
-                        f"--backbone dinov3_dapt_b_fpn --protocol frozen --skip-done")
+            env, pre = dapt_env(a, w)
+            cmds += pre + [f"{env}python run_benchmark_server.py --all-seeds "
+                           f"--backbone dinov3_dapt_b_fpn --protocol frozen --skip-done"]
     rows.append(("E3", f"ablation: DAPT arms x 9 datasets x frozen x seed 42", done, per_arm * len(ABLATION_ARMS),
                  [f"cd {to_posix(BENCH)}"] + cmds if cmds else [], "main-arm frozen runs are shared with E2"))
 
@@ -190,7 +212,8 @@ def exp_status():
                 cmds.append(f"# {bb}: waiting for E1 ({MAIN_ARM})")
                 continue
             n = count(abl_runs, bb, sha256(main_w), protocols={"frozen"}, datasets=RES_ABL["datasets"])
-            env = f"DINOV3_DAPT_B_WEIGHTS={to_posix(main_w)} "
+            env, pre = dapt_env(MAIN_ARM, main_w)
+            cmds += pre if n < per_bb else []
         else:
             n = count(abl_runs, bb, protocols={"frozen"}, datasets=RES_ABL["datasets"])
             env = ""
@@ -216,12 +239,30 @@ def cmd_status(_):
         print(f"{mark} {eid}  {done:>4}/{total:<4} {title}\n            {note}")
 
 
+def _is_bench_cmd(c: str) -> bool:
+    return c.startswith("python run_benchmark") or c.startswith("DINOV3_DAPT_B_WEIGHTS=")
+
+
 def cmd_commands(args):
     for eid, title, done, total, cmds, note in exp_status():
         if args.ids and eid not in args.ids:
             continue
         print(f"\n### {eid} — {title}  [{done}/{total}]")
-        print("\n".join(cmds) if cmds else "# complete")
+        if not cmds:
+            print("# complete")
+            continue
+        bench = [c for c in cmds if _is_bench_cmd(c)]
+        if not args.gcp or not bench:
+            print("\n".join(cmds))
+            continue
+        # GCP: everything that runs on the bench VM becomes ONE BENCH_CMD (benchmark repo, WSL: ./bench_gcp.sh)
+        print("\n".join(c for c in cmds if not _is_bench_cmd(c) and not c.startswith("cd ")))
+        smoke = " && ".join(c.replace(" --skip-done", " --smoke") for c in bench)
+        print(f"cd {to_posix(BENCH)}")
+        print(f"# 1) 先在 VM 上冒烟(几分钟,验证环境/显存):\nBENCH_CMD='{smoke}' ./bench_gcp.sh start")
+        print("./bench_gcp.sh status    # 看到 DONE 后 -> ./bench_gcp.sh fetch   (结果在 stage1_out/benchmark_results*_smoke/)")
+        print(f"# 2) 正式跑(复用同一台 VM:up 会把已关机的实例重新开机):\nBENCH_CMD='{' && '.join(bench)}' ./bench_gcp.sh start")
+        print("./bench_gcp.sh status    # DONE 后 -> ./bench_gcp.sh finish  (取回到 stage1_out/ 并删除实例)")
 
 
 # ── C3 analysis: object size in ViT tokens ──────────────────────────────────────────────────
@@ -386,6 +427,7 @@ def main():
     sub.add_parser("status")
     c = sub.add_parser("commands")
     c.add_argument("ids", nargs="*")
+    c.add_argument("--gcp", action="store_true", help="print benchmark steps as one BENCH_CMD per experiment for bench_gcp.sh")
     sub.add_parser("tokens")
     sub.add_parser("tables")
     args = ap.parse_args()

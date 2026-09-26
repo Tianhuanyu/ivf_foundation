@@ -3,6 +3,7 @@
 > 写给接手这个项目的人。读完这一份应该能知道：项目在做什么、已经做了哪些决定、代码在哪、下一步按什么顺序跑哪些脚本。
 > - **论文主线、主张、预先登记的判定规则**：[`PAPER.md`](PAPER.md)
 > - **实验进度、命令、出表**：`python experiments/paper.py status | commands | tokens | tables`
+> - **GCP 上的命令顺序（直接复制粘贴）**：[`GCP_WORKFLOW.md`](GCP_WORKFLOW.md)
 > - **操作手册**（环境、训练、GCP）：[`README.md`](README.md)
 > - 用 Claude Code 打开本仓库时，[`CLAUDE.md`](CLAUDE.md) 会自动加载，可以直接问 Claude（见 §9）。
 >
@@ -101,8 +102,7 @@ experiments/paper.py tables → experiments/out/tables.md（T0–T3）
 
 | 脚本 | 作用 |
 |---|---|
-| `nohup setsid bash experiments/smoke_wsl.sh > smoke_out/smoke_wsl.log 2>&1 &`（WSL） | 数据准备、6 个 DAPT 臂加 long、GCP 脚本静态检查、patch 检查、权重交接、E0/E2/E3/E4 的 benchmark 冒烟，约 3.5 小时。**必须后台脱离运行**，进度看 `smoke_out/SUMMARY_wsl.txt` |
-| `python experiments\smoke_windows.py`（Windows，等 WSL 那边跑完） | 12/13 号脚本、两套 split 的只读检查、全部报告脚本、`paper.py` |
+| `nohup setsid bash experiments/smoke.sh > smoke_out/smoke.log 2>&1 &`（WSL） | **唯一的冒烟脚本**：数据准备、6 个 DAPT 臂加 long、GCP 脚本静态检查、patch 检查、权重交接、split 检查、E0/E2/E3/E4 的 benchmark、报告脚本、`paper.py`，约 3.5 小时。**必须后台脱离运行**，进度看 `smoke_out/SUMMARY.txt`；只跑其中几组可以用 `STEPS="…"` |
 | `bash experiments/check_patch.sh`（WSL） | 单独检查 patch 能否在全新的上游 clone 上复现工作区 |
 | 各入口的冒烟开关 | benchmark runner 加 `--smoke`；训练用 `SMOKE=1 ARM=… scripts/dapt_run.sh` |
 

@@ -5,9 +5,8 @@
 - **不碰真实产物**：
   - 冒烟输出在训练仓库的 `smoke_out/`，以及 benchmark 仓库的 `stage1_out/benchmark_results_smoke/`、`benchmark_results_imgsz320_smoke/`；
   - 权重登记写的是登记表的副本。
-- **怎么重跑**：
-  - WSL：`nohup setsid bash experiments/smoke_wsl.sh > smoke_out/smoke_wsl.log 2>&1 &`，一定要后台脱离运行；
-  - Windows：`C:\ProgramData\miniconda3\python.exe experiments\smoke_windows.py`。
+- **怎么重跑**（2026-09-26 起合并成一个脚本，全部在 WSL 里跑）：`nohup setsid bash experiments/smoke.sh > smoke_out/smoke.log 2>&1 &`，一定要后台脱离运行。
+- **合并后的复测**：除 bench 以外的分组全部重跑通过（bench 分组的命令与下表那次完全相同）。复测时又发现并修了一个问题：`report_common.py` 里的登记表路径写死成了 Windows 路径，所以在 WSL 或 GCP VM 上找不到登记表，DAPT 变体只能显示成 sha。现在路径按系统自动选择，`--ours` 也能直接接受权重 sha 前缀。
 - **每一步的日志**：`smoke_out/logs/`。
 
 **结果：WSL 36 项 + Windows 17 项，全部 PASS。** 其中 3 处是冒烟脚本本身的问题（下面标 ⓘ），已修复并重跑通过。

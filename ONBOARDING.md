@@ -97,6 +97,15 @@ experiments/paper.py tables → experiments/out/tables.md（T0–T3）
 | `python experiments/paper.py tokens` | 目标尺寸换算成 token 数的分析，本地几分钟 → `experiments/out/table_tokens.md` |
 | `python experiments/paper.py tables` | 用已有结果生成 T0–T3 表 → `experiments/out/tables.md` |
 
+**开跑前：冒烟测试**（每次改代码后、正式训练或上传前都跑一遍；最近一次结果见 [`experiments/SMOKE_RESULTS.md`](experiments/SMOKE_RESULTS.md)）
+
+| 脚本 | 作用 |
+|---|---|
+| `nohup setsid bash experiments/smoke_wsl.sh > smoke_out/smoke_wsl.log 2>&1 &`（WSL） | 数据准备、6 个 DAPT 臂加 long、GCP 脚本静态检查、patch 检查、权重交接、E0/E2/E3/E4 的 benchmark 冒烟，约 3.5 小时。**必须后台脱离运行**，进度看 `smoke_out/SUMMARY_wsl.txt` |
+| `python experiments\smoke_windows.py`（Windows，等 WSL 那边跑完） | 12/13 号脚本、两套 split 的只读检查、全部报告脚本、`paper.py` |
+| `bash experiments/check_patch.sh`（WSL） | 单独检查 patch 能否在全新的上游 clone 上复现工作区 |
+| 各入口的冒烟开关 | benchmark runner 加 `--smoke`；训练用 `SMOKE=1 ARM=… scripts/dapt_run.sh` |
+
 **阶段 1：E0**（benchmark 仓库，GPU 机器；命令由 `paper.py commands E0` 给出）
 
 | 脚本 | 作用 |

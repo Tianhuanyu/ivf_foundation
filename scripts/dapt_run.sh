@@ -7,6 +7,7 @@
 # ARM/BUDGET 的定义只在 scripts/dapt_arms.sh。可选环境变量:
 #   DINO_BATCH(默认 16,12GB 卡)  RUN_TAG(输出目录名后缀,比如 seed43)  EXTRA_OPTS(额外 dotlist)
 #   OUT_DIR / BB_OUT(覆盖下面两个输出路径)
+#   SMOKE=1: 冒烟测试——5 iter / batch 2,输出到 smoke_out/(不碰 weights/),只验证能跑通
 # 输出: dinov3_dapt_<arm>_<budget>[_<tag>]_out/  和  weights/dinov3_vitb16_dapt_<同名>_backbone.pth
 # =============================================================================
 set -euo pipefail
@@ -17,6 +18,12 @@ ARM="${ARM:?need ARM (one of: $DAPT_ARMS)}"
 BUDGET="${BUDGET:-e1}"
 DINO_BATCH="${DINO_BATCH:-16}"
 RUN="${ARM}_${BUDGET}${RUN_TAG:+_$RUN_TAG}"
+if [ "${SMOKE:-0}" = "1" ]; then
+  DINO_BATCH=2
+  EXTRA_OPTS="train.OFFICIAL_EPOCH_LENGTH=5 optim.epochs=1 checkpointing.period=5 train.num_workers=2 ${EXTRA_OPTS:-}"
+  OUT_DIR="${OUT_DIR:-$ROOT/smoke_out/dapt_${RUN}_out}"
+  BB_OUT="${BB_OUT:-$ROOT/smoke_out/dinov3_vitb16_dapt_${RUN}_backbone.pth}"
+fi
 OUT="${OUT_DIR:-$ROOT/dinov3_dapt_${RUN}_out}"
 BB="${BB_OUT:-$ROOT/weights/dinov3_vitb16_dapt_${RUN}_backbone.pth}"
 FRAMES="$ROOT/frames_hires/train"

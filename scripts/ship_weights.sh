@@ -21,7 +21,7 @@ DEST="${2:?缺少目标路径}"
 PRODUCED_BY="${3:-未填写}"
 TRAIN_CONFIG="${4:-未填写}"
 
-REGISTRY="/mnt/d/Conceivable-ML/WEIGHTS_REGISTRY.md"
+REGISTRY="${WEIGHTS_REGISTRY:-/mnt/d/Conceivable-ML/WEIGHTS_REGISTRY.md}"   # 冒烟测试时指向一份副本
 CONSUMED_BY="${SHIP_CONSUMED_BY:-待定(尚未跑 benchmark)}"
 
 [ -f "$SRC" ] || { echo "!! 源文件不存在: $SRC"; exit 1; }
@@ -37,6 +37,16 @@ cp -v "$SRC" "$DEST"
 
 echo "[3/3] 登记到 $REGISTRY"
 NOW="$(date '+%Y-%m-%d %H:%M')"
+# 追加到文件末尾的专用表里(没有就先建表头);以前是直接追加,新行会落在"## 待办"段下面、不在任何表格里。
+AUTO_HDR="## 交接记录(ship_weights.sh 自动追加)"
+if ! grep -qF "$AUTO_HDR" "$REGISTRY"; then
+  printf '
+%s
+
+| 权重文件 | sha256 | 产出方 | 训练配置 | 交接时间 | 复制到 | 被哪次 benchmark 使用 | 校验状态 |
+|---|---|---|---|---|---|---|---|
+' "$AUTO_HDR" >> "$REGISTRY"
+fi
 FNAME="$(basename "$SRC")"
 DEST_REL="$(echo "$DEST" | sed 's#.*/stage1_out/#stage1_out/#')"
 printf '| `%s` | `%s` | %s | %s | %s | `%s` | %s | 未核对 |\n' \

@@ -52,7 +52,8 @@ RES_ABL = dict(imgsz=320, protocol="frozen",
 SEEDS = runner.SEEDS
 ALL_DATASETS = list(runner.TASK_CFG)                       # the runner always runs all 9 (DROP ones are reported excluded)
 DETECT_DATASETS = [d for d in ALL_DATASETS if d not in ("cellasp", "icsi_seg")]
-RES_ABL_DIR = BENCH / "stage1_out" / f"benchmark_results_imgsz{RES_ABL['imgsz']}"
+RES_ABL_DIR = Path(os.environ.get("PAPER_RES_ABL_DIR", BENCH / "stage1_out" / f"benchmark_results_imgsz{RES_ABL['imgsz']}"))
+RESULTS_DIR = Path(os.environ.get("PAPER_RESULTS_DIR", runner.OUTDIR))   # overridable for smoke tests
 PATCH = 16
 
 # measured cost anchors (A100-40GB): e1 DAPT 3000 it @ batch16 = 51 min (1.0 s/it, gcp_outputs log 2026-09-22);
@@ -104,12 +105,12 @@ def to_posix(p: Path) -> str:
 # ── experiments ──────────────────────────────────────────────────────────────────────────────
 def exp_status():
     """-> list of (id, title, done, total, [commands for what's missing], note)"""
-    main_runs = runs_in(runner.OUTDIR)
+    main_runs = runs_in(RESULTS_DIR)
     abl_runs = runs_in(RES_ABL_DIR)
     rows = []
 
     # E0 — auxiliary: is a ViT foundation model worth it vs a CNN? (held-out acquisition batches)
-    e0_runs = runs_in(runner.OUTDIR, E0["split_profile"])
+    e0_runs = runs_in(RESULTS_DIR, E0["split_profile"])
     shipped_path, shipped_sha = weights_identity("dinov3_dapt_b_fpn")
     per_bb = len(E0["datasets"]) * 2 * len(SEEDS)
     done, cmds = 0, []
@@ -293,7 +294,7 @@ def _delta_summary(deltas):
 
 def cmd_tables(_):
     OUT.mkdir(parents=True, exist_ok=True)
-    main_runs = [r for r in runs_in(runner.OUTDIR) if r.dataset not in rc.DROP and r.seed in SEEDS]
+    main_runs = [r for r in runs_in(RESULTS_DIR) if r.dataset not in rc.DROP and r.seed in SEEDS]
     task = rc.task_of(main_runs)
     arm_sha = {a: sha256(arm_weights(a)) for a in ABLATION_ARMS if arm_weights(a)}
     sha_arm = {v: k for k, v in arm_sha.items()}
@@ -310,7 +311,7 @@ def cmd_tables(_):
 
     # T0 auxiliary (E0): CNN vs ViT on held-out acquisition batches
     _, shipped_sha = weights_identity("dinov3_dapt_b_fpn")
-    e0 = [r for r in runs_in(runner.OUTDIR, E0["split_profile"]) if r.dataset in E0["datasets"] and r.seed in SEEDS]
+    e0 = [r for r in runs_in(RESULTS_DIR, E0["split_profile"]) if r.dataset in E0["datasets"] and r.seed in SEEDS]
     e0_key = lambda r: ("dapt" if r.weights_sha256 == shipped_sha else None) if r.backbone == "dinov3_dapt_b_fpn" else r.backbone
     agg0, idx0 = rc.aggregate(e0, key=e0_key), rc.index_runs(e0, key=e0_key)
     task0 = rc.task_of(e0)

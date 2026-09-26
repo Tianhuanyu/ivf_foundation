@@ -35,7 +35,7 @@ def probe_duration(video: str) -> float:
 
 
 def extract_one(video: str, out_root: str, split: str, fps: float, short: int,
-                quality: int, max_frames: int):
+                quality: int, max_frames: int, grayscale: bool = False):
     vp = Path(video)
     stage = parse_stage(vp.name)
     out_dir = Path(out_root) / split / stage
@@ -52,6 +52,8 @@ def extract_one(video: str, out_root: str, split: str, fps: float, short: int,
         if dur > 0:
             eff_fps = min(fps, max_frames / dur)
     vf = (f"fps={eff_fps},scale='if(gt(iw,ih),-2,{short})':'if(gt(iw,ih),{short},-2)'")
+    if grayscale:
+        vf += ",format=gray"
     cmd = ["ffmpeg", "-nostdin", "-v", "error", "-i", str(vp),
            "-vf", vf, "-q:v", str(quality), pattern]
     try:
@@ -72,6 +74,8 @@ def main():
     ap.add_argument("--quality", type=int, default=3, help="ffmpeg -q:v (2=best..31)")
     ap.add_argument("--max-frames", type=int, default=60,
                     help="cap frames per video (evenly spread); 0 = no cap")
+    ap.add_argument("--grayscale", action="store_true",
+                    help="输出灰度 JPG(省磁盘;显微图本就灰度,细路 I-JEPA 用)")
     ap.add_argument("--workers", type=int, default=max(2, (os.cpu_count() or 4) - 2))
     ap.add_argument("--limit", type=int, default=0, help="only first N videos (smoke test)")
     args = ap.parse_args()
@@ -85,7 +89,8 @@ def main():
     total_frames = ok = skipped = errors = 0
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         futs = [ex.submit(extract_one, v, args.out, args.split, args.fps,
-                          args.short, args.quality, args.max_frames) for v in videos]
+                          args.short, args.quality, args.max_frames, args.grayscale)
+                for v in videos]
         for i, fut in enumerate(as_completed(futs), 1):
             video, status, n = fut.result()
             if status == "ok":

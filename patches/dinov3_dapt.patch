@@ -1,0 +1,1816 @@
+diff --git a/dinov3/checkpointer/__init__.py b/dinov3/checkpointer/__init__.py
+index 120712c..7f54c3c 100644
+--- a/dinov3/checkpointer/__init__.py
++++ b/dinov3/checkpointer/__init__.py
+@@ -8,6 +8,7 @@ from .checkpointer import (
+     cleanup_checkpoint,
+     find_all_checkpoints,
+     find_latest_checkpoint,
++    init_fsdp_backbone_from_pretrained,
+     init_fsdp_model_from_checkpoint,
+     init_model_from_checkpoint_for_evals,
+     keep_checkpoint_copy,
+diff --git a/dinov3/checkpointer/checkpointer.py b/dinov3/checkpointer/checkpointer.py
+index 7a98411..af85f88 100644
+--- a/dinov3/checkpointer/checkpointer.py
++++ b/dinov3/checkpointer/checkpointer.py
+@@ -304,6 +304,43 @@ def init_fsdp_model_from_checkpoint(
+         load_checkpoint(ckpt_dir=checkpoint_path, model=model, process_group=process_group)
+ 
+ 
++def init_fsdp_backbone_from_pretrained(
++    backbone: torch.nn.Module,
++    checkpoint_path: str,
++    keys_not_sharded: List[str] | None = None,
++    process_group: dist.ProcessGroup = None,
++):
++    """Load a BARE (unsharded) backbone state_dict into an FSDP-wrapped backbone.
++
++    Used for domain-adaptive continued pretraining: initialize the student
++    backbone from a released DINOv3 backbone checkpoint (which has NO SSL heads).
++    Heads keep their fresh init. Mirrors init_fsdp_model_from_checkpoint's tensor
++    distribution but targets the backbone submodule and loads non-strict.
++    """
++    keys_not_sharded = keys_not_sharded or []
++    logger.info(f"Loading pretrained backbone weights from {checkpoint_path}")
++    chkpt = torch.load(checkpoint_path, map_location="cpu")
++    for wrap_key in ("teacher", "model", "state_dict"):
++        if isinstance(chkpt, dict) and wrap_key in chkpt and isinstance(chkpt[wrap_key], dict):
++            chkpt = chkpt[wrap_key]
++    from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
++
++    if process_group is None:
++        world_mesh = init_device_mesh("cuda", mesh_shape=(dist.get_world_size(),), mesh_dim_names=("dp",))
++    else:
++        world_mesh = DeviceMesh.from_group(process_group, "cuda")
++    chkpt = {
++        key: (
++            tensor
++            if any(k in key for k in keys_not_sharded)
++            else torch.distributed.tensor.distribute_tensor(tensor, world_mesh, src_data_rank=None)
++        )
++        for key, tensor in chkpt.items()
++    }
++    msg = backbone.load_state_dict(chkpt, strict=False)
++    logger.info(f"Pretrained backbone loaded. missing={list(msg.missing_keys)} unexpected={list(msg.unexpected_keys)}")
++
++
+ # Initialize a standard non distributed PyTorch model from PyTorch standard checkpoint for evals
+ def init_model_from_checkpoint_for_evals(
+     model: torch.nn.Module, pretrained_weights: str | Path, checkpoint_key: str = None
+diff --git a/dinov3/configs/ssl_default_config.yaml b/dinov3/configs/ssl_default_config.yaml
+index 8002aac..021a49b 100644
+--- a/dinov3/configs/ssl_default_config.yaml
++++ b/dinov3/configs/ssl_default_config.yaml
+@@ -42,6 +42,27 @@ ibot:
+   head_norm_last_layer: false
+   head_nlayers: 3
+   head_hidden_dim: 2048
++ibot_local:
++  # Masked-patch prediction on LOCAL (native-resolution) crops, guided by a
++  # per-crop saliency map (motion-energy, see dinov3/data/crop_sampler.py's
++  # content/motion arms) rather than random block placement. Off by default:
++  # the stock DINOv3 recipe never masks local crops at all (see
++  # dinov3/data/masking.py's MotionGuidedMaskingGenerator docstring), so every
++  # existing config is untouched unless this is explicitly turned on.
++  enabled: false
++  loss_weight: 1.0
++  mask_sample_probability: 0.5
++  mask_ratio_min_max:
++  - 0.1
++  - 0.5
++  # "mask_high_saliency" (AttMask, ECCV'22): hide the salient regions harder,
++  # forcing precise reconstruction -- our default, since the goal is sharper
++  # representations of small/thin structures. "mask_low_saliency"
++  # (MotionMAE/V-JEPA4A, ICCV'23/GCPR'26): keep salient regions visible as
++  # context, mask background -- the other arm of the A/B this is meant to run.
++  direction: mask_high_saliency
++  saliency_gamma: 1.0
++  n_candidates: 6
+ gram:
+   use_loss: false # (bool) if true gram is used, else not
+   compute_stats: false # (bool): if true compute auxilliary stats
+@@ -156,6 +177,11 @@ crops:
+   global_crops_size: 224
+   local_crops_size: 96
+   global_local_crop_pairs_ratios: 1.0
++  local_crops_native: false  # if true, local crops = native-res RandomCrop (no downscale) -> fine detail
++  crop_sampler: uniform  # one of uniform/content/motion (requires local_crops_native=true for
++                         # content/motion) -- see dinov3/data/crop_sampler.py
++  crop_sampler_temp: 0.3 # sampling temperature for content/motion: lower = greedier (favors
++                         # highest-score windows), higher = closer to uniform random
+   gram_teacher_crops_size: null  # If not None, return crops for gram teacher
+   localcrops_subset_of_globalcrops: false
+   share_color_jitter: false
+diff --git a/dinov3/data/augmentations.py b/dinov3/data/augmentations.py
+index 710cfd1..e5b49dc 100644
+--- a/dinov3/data/augmentations.py
++++ b/dinov3/data/augmentations.py
+@@ -4,17 +4,45 @@
+ # the terms of the DINOv3 License Agreement.
+ 
+ import logging
++import os
+ 
+ import numpy as np
+ import torch
++from PIL import Image as PILImage
+ from torch import nn
+ from torchvision.transforms import v2
+ 
++from dinov3.data.adaptive_crop import pad_if_needed
++from dinov3.data.crop_sampler import CROP_SAMPLERS, build_crop_sampler
+ from dinov3.data.transforms import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, GaussianBlur, make_normalize_transform
+ 
+ logger = logging.getLogger("dinov3")
+ 
+ 
++def _local_crop_saliency(image, position, size, patch_grid, me_path):
++    """Per-local-crop saliency map for ibot_local masking guidance (see
++    masking.py), downsampled to the local crop's OWN patch-token grid
++    resolution. Returns None (-> masking.py falls back to plain random local
++    masking for this crop) if there's no position (e.g. UniformCropSampler,
++    which deliberately doesn't expose one) or no usable motion-energy sidecar
++    -- same graceful-degradation convention as crop_sampler.py itself."""
++    if position is None or not me_path or not os.path.exists(me_path):
++        return None
++    try:
++        me = PILImage.open(me_path).convert("L").resize(image.size, PILImage.BILINEAR)
++        me = pad_if_needed(me, size)  # mirror the padding crop_sampler applied to `image`
++        top, left = position
++        patch = me.crop((left, top, left + size, top + size)).resize(
++            (patch_grid, patch_grid), PILImage.BILINEAR
++        )
++        arr = np.asarray(patch, dtype=np.float32)
++        denom = arr.max()
++        return arr / denom if denom > 1e-6 else arr  # same max-normalize convention as crop_sampler.py
++    except Exception as e:
++        logger.warning(f"[ibot_local] saliency lookup failed ({e}); falling back to plain random local masking")
++        return None
++
++
+ class DataAugmentationDINO(object):
+     def __init__(
+         self,
+@@ -30,9 +58,27 @@ class DataAugmentationDINO(object):
+         patch_size=16,
+         share_color_jitter=False,
+         horizontal_flips=True,
++        local_crops_native=False,
++        crop_sampler="uniform",
++        crop_sampler_temp=0.3,
++        ibot_local_enabled=False,
+         mean=IMAGENET_DEFAULT_MEAN,
+         std=IMAGENET_DEFAULT_STD,
+     ):
++        self.local_crops_native = local_crops_native
++        self.crop_sampler_name = crop_sampler
++        self.crop_sampler_temp = crop_sampler_temp
++        # ibot_local: local-crop counterpart of ibot masking (see
++        # dinov3/data/masking.py's MotionGuidedMaskingGenerator and
++        # ssl_meta_arch.py) -- this class's job is only to hand each local
++        # crop a co-registered per-patch saliency map (or None) alongside the
++        # crop itself; masking.py decides HOW to turn that into a mask.
++        self.ibot_local_enabled = ibot_local_enabled
++        if crop_sampler not in CROP_SAMPLERS:
++            raise ValueError(f"crop_sampler must be one of {CROP_SAMPLERS}, got '{crop_sampler}'")
++        if crop_sampler != "uniform" and not local_crops_native:
++            raise ValueError("crop_sampler='content'/'motion' requires local_crops_native=True "
++                              "(non-uniform positions only make sense on native-resolution crops)")
+         self.global_crops_scale = global_crops_scale
+         self.local_crops_scale = local_crops_scale
+         self.local_crops_number = local_crops_number
+@@ -107,16 +153,35 @@ class DataAugmentationDINO(object):
+                 interpolation=v2.InterpolationMode.BICUBIC,
+             )
+ 
+-        self.geometric_augmentation_local = v2.Compose(
+-            [
+-                v2.RandomResizedCrop(
+-                    local_crops_size,
+-                    scale=local_crops_scale,
+-                    interpolation=v2.InterpolationMode.BICUBIC,
+-                ),
+-                v2.RandomHorizontalFlip(p=0.5 if horizontal_flips else 0.0),
+-            ]
+-        )
++        # geometric_augmentation_local stays the pre-refactor path when
++        # local_crops_native=False (RandomResizedCrop; not currently used by any
++        # of our experiments, left untouched). When local_crops_native=True, ALL
++        # THREE crop_sampler arms (uniform/content/motion) go through
++        # self._crop_sampler instead: E1's whole point is that these three must
++        # share every mechanic except the score map, which a per-arm
++        # v2.Compose branch could not guarantee (see crop_sampler.py header).
++        self.geometric_augmentation_local = None
++        self._crop_sampler = None
++        if local_crops_native:
++            self._crop_sampler = build_crop_sampler(crop_sampler, temperature=crop_sampler_temp)
++            logger.info(f"local crops: NATIVE crop({local_crops_size}), "
++                        f"crop_sampler={crop_sampler} temp={crop_sampler_temp} (see crop_sampler.py)")
++            # Kept as an explicit probability (not a v2.RandomHorizontalFlip transform
++            # object) so __call__ can apply the SAME flip decision to both the crop and
++            # its ibot_local saliency map -- they must stay pixel-aligned.
++            self._local_flip_p = 0.5 if horizontal_flips else 0.0
++        else:
++            local_geom = v2.RandomResizedCrop(
++                local_crops_size,
++                scale=local_crops_scale,
++                interpolation=v2.InterpolationMode.BICUBIC,
++            )
++            self.geometric_augmentation_local = v2.Compose(
++                [
++                    local_geom,
++                    v2.RandomHorizontalFlip(p=0.5 if horizontal_flips else 0.0),
++                ]
++            )
+ 
+         # color distortions / blurring
+         color_jittering = v2.Compose(
+@@ -218,9 +283,42 @@ class DataAugmentationDINO(object):
+             output["local_crops"] = local_crops
+             output["offsets"] = offsets
+         else:
+-            local_crops = [
+-                self.local_transfo(self.geometric_augmentation_local(image)) for _ in range(self.local_crops_number)
+-            ]
++            if self.local_crops_native:
++                filename = getattr(image, "filename", None)
++                me_path = f"{filename}.me.png" if filename else None
++                meta = {"motion_energy_path": me_path}
++                raw_locals, raw_positions = self._crop_sampler.sample(
++                    image, self.local_crops_number, self.local_crops_size, meta
++                )
++                if raw_positions is None:
++                    raw_positions = [None] * len(raw_locals)
++
++                local_crops = []
++                local_saliency = []
++                for c, pos in zip(raw_locals, raw_positions):
++                    # Flip made explicit (rather than via self._local_flip as a
++                    # black-box transform) so the SAME decision can be mirrored
++                    # onto the saliency map below -- they must stay pixel-aligned.
++                    flip = self._local_flip_p > 0 and torch.rand(()).item() < self._local_flip_p
++                    if flip:
++                        c = v2.functional.hflip(c)
++                    local_crops.append(self.local_transfo(c))
++
++                    saliency = None
++                    if self.ibot_local_enabled:
++                        patch_grid = self.local_crops_size // self.patch_size
++                        saliency = _local_crop_saliency(
++                            image, pos, self.local_crops_size, patch_grid, me_path
++                        )
++                        if saliency is not None and flip:
++                            saliency = np.ascontiguousarray(saliency[:, ::-1])
++                    local_saliency.append(saliency)
++                output["local_crops_saliency"] = local_saliency
++            else:
++                local_crops = [
++                    self.local_transfo(self.geometric_augmentation_local(image))
++                    for _ in range(self.local_crops_number)
++                ]
+             output["local_crops"] = local_crops
+             output["offsets"] = ()
+ 
+diff --git a/dinov3/data/collate.py b/dinov3/data/collate.py
+index 8470008..8144474 100644
+--- a/dinov3/data/collate.py
++++ b/dinov3/data/collate.py
+@@ -17,6 +17,14 @@ def collate_data_and_cast(
+     mask_generator=None,
+     random_circular_shift=False,
+     local_batch_size=None,
++    # ibot_local (see dinov3/data/masking.py's MotionGuidedMaskingGenerator,
++    # dinov3/train/ssl_meta_arch.py): all default to "off", so any config that
++    # doesn't ask for this produces the byte-identical collated batch as before
++    # (no "local_ibot_*" keys at all in the output dict).
++    local_mask_generator=None,
++    local_mask_ratio_tuple=None,
++    local_mask_probability=0.0,
++    local_n_tokens=None,
+ ):
+     n_global_crops = len(samples_list[0][0]["global_crops"])
+     n_local_crops = len(samples_list[0][0]["local_crops"])
+@@ -75,6 +83,63 @@ def collate_data_and_cast(
+     }
+     if collated_gram_teacher_crops is not None:
+         out["collated_gram_teacher_crops"] = collated_gram_teacher_crops.to(dtype)
++
++    if local_mask_generator is not None:
++        # ibot_local: mirrors the global-crop masking above, with two
++        # differences forced by needing each mask to actually correspond to
++        # the saliency of the crop it's applied to:
++        #  1. n_samples_masked/probs/upperbound are computed the same way,
++        #     but against B_local (= n_local_crops * len(samples_list)), the
++        #     local-crop batch size, not the global one.
++        #  2. WHICH of the B_local crop instances get masked is chosen by
++        #     shuffling instance indices first (so the masked/unmasked split
++        #     isn't systematically biased toward e.g. always local_crops[0]),
++        #     but each chosen instance's mask is generated using THAT
++        #     instance's own saliency map and written directly into its own
++        #     slot in local_masks_list -- unlike the global path, there is no
++        #     shuffle-after-generation, because that would decouple a mask
++        #     from the saliency it was biased against.
++        n_samples = len(samples_list)
++        B_local = n_local_crops * n_samples
++        local_saliency_flat = [
++            s[0]["local_crops_saliency"][i] for i in range(n_local_crops) for s in samples_list
++        ]
++
++        N_local = local_n_tokens
++        n_local_masked = int(B_local * local_mask_probability)
++        local_probs = torch.linspace(*local_mask_ratio_tuple, n_local_masked + 1)
++        local_upperbound = 0
++        local_masks_list = [None] * B_local
++        order = list(range(B_local))
++        random.shuffle(order)
++        for i in range(n_local_masked):
++            flat_idx = order[i]
++            prob_max = local_probs[i + 1]
++            num_masking_patches = int(N_local * prob_max)
++            local_mask_generator.set_saliency(local_saliency_flat[flat_idx])
++            local_masks_list[flat_idx] = torch.BoolTensor(local_mask_generator(num_masking_patches))
++            local_upperbound += num_masking_patches
++        for i in range(n_local_masked, B_local):
++            flat_idx = order[i]
++            local_mask_generator.set_saliency(None)
++            local_masks_list[flat_idx] = torch.BoolTensor(local_mask_generator(0))
++
++        collated_local_masks = torch.stack(local_masks_list).flatten(1)
++        local_mask_indices_list = collated_local_masks.flatten().nonzero().flatten()
++        local_masks_weight = (
++            (1 / collated_local_masks.sum(-1).clamp(min=1.0))
++            .unsqueeze(-1)
++            .expand_as(collated_local_masks)[collated_local_masks]
++        )
++
++        out["collated_local_masks"] = collated_local_masks
++        out["local_mask_indices_list"] = local_mask_indices_list
++        out["local_masks_weight"] = local_masks_weight
++        out["local_upperbound"] = local_upperbound
++        out["n_masked_local_patches"] = torch.full(
++            (1,), fill_value=local_mask_indices_list.shape[0], dtype=torch.long
++        )
++
+     return out
+ 
+ 
+diff --git a/dinov3/data/datasets/__init__.py b/dinov3/data/datasets/__init__.py
+index 9075e9f..9df34d6 100644
+--- a/dinov3/data/datasets/__init__.py
++++ b/dinov3/data/datasets/__init__.py
+@@ -5,6 +5,7 @@
+ 
+ from .ade20k import ADE20K
+ from .coco_captions import CocoCaptions
++from .frames import Frames
+ from .image_net import ImageNet
+ from .image_net_22k import ImageNet22k
+ from .nyu import NYU
+diff --git a/dinov3/data/loaders.py b/dinov3/data/loaders.py
+index 6a55ad6..00c398d 100644
+--- a/dinov3/data/loaders.py
++++ b/dinov3/data/loaders.py
+@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
+ import torch
+ from torch.utils.data import Sampler
+ 
+-from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k, NYU
++from .datasets import ADE20K, CocoCaptions, Frames, ImageNet, ImageNet22k, NYU
+ from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
+ 
+ logger = logging.getLogger("dinov3")
+@@ -54,7 +54,9 @@ def _parse_dataset_str(dataset_str: str):
+         assert key in ("root", "extra", "split")
+         kwargs[key] = value
+ 
+-    if name == "ImageNet":
++    if name == "Frames":
++        class_ = Frames
++    elif name == "ImageNet":
+         class_ = ImageNet
+         if "split" in kwargs:
+             kwargs["split"] = ImageNet.Split[kwargs["split"]]
+diff --git a/dinov3/data/masking.py b/dinov3/data/masking.py
+index 691c311..d941d38 100644
+--- a/dinov3/data/masking.py
++++ b/dinov3/data/masking.py
+@@ -92,3 +92,86 @@ class MaskingGenerator:
+         to_add = np.random.choice(np.where(~m2)[0], size=num_masking_patches - m2.sum(), replace=False)
+         m2[to_add] = True
+         return m2.reshape(shape)
++
++
++class MotionGuidedMaskingGenerator(MaskingGenerator):
++    """ibot_local's masking generator (see ssl_meta_arch.py / augmentations.py's
++    _local_crop_saliency) -- same block-wise random-shape algorithm as the base
++    MaskingGenerator (used for GLOBAL crops, untouched, zero risk to it), except
++    each candidate block's (top, left) placement is accepted/rejected based on
++    the block's mean value in a per-image saliency map, rather than accepted
++    unconditionally. direction="mask_high_saliency" biases masking TOWARD the
++    salient (e.g. high motion-energy) regions -- AttMask's (ECCV'22) "hide the
++    important stuff, force the model to predict it precisely" philosophy, which
++    is what we actually want here (learn a sharper representation of exactly
++    the fine/thin structures the resolution-bottleneck diagnosis flagged as
++    poorly encoded) as opposed to MotionMAE/V-JEPA4A's opposite convention
++    (keep salient regions visible as context, mask background) which targets
++    general scene-understanding transfer (segmentation/tracking) rather than
++    precise small-object localization. direction="mask_low_saliency" gives the
++    opposite (available for the A/B this module's docstring elsewhere calls
++    for -- don't assume the AttMask direction wins here without testing both).
++
++    saliency=None (e.g. UniformCropSampler's crops, or a missing/bad sidecar)
++    -> falls back to the exact base-class unconditional-accept behavior, i.e.
++    plain random block masking. Same graceful-degradation convention as
++    crop_sampler.py.
++    """
++
++    def __init__(self, *args, direction="mask_high_saliency", gamma=1.0, n_candidates=6, **kwargs):
++        super().__init__(*args, **kwargs)
++        assert direction in ("mask_high_saliency", "mask_low_saliency")
++        self.direction = direction
++        self.gamma = gamma
++        self.n_candidates = n_candidates
++        self._saliency = None  # set per-image via set_saliency() before each __call__
++
++    def set_saliency(self, saliency):
++        """saliency: (height, width) float array in [0,1] matching this
++        generator's own token grid (i.e. already resized to local crop's
++        patch grid by augmentations.py), or None."""
++        self._saliency = saliency
++
++    def _block_weight(self, top, left, h, w):
++        region = self._saliency[top : top + h, left : left + w]
++        m = float(region.mean())
++        if self.direction == "mask_low_saliency":
++            m = 1.0 - m
++        return m**self.gamma
++
++    def _mask(self, mask, max_mask_patches):
++        if self._saliency is None:
++            return super()._mask(mask, max_mask_patches)
++
++        delta = 0
++        for _ in range(10):
++            target_area = random.uniform(self.min_num_patches, max_mask_patches)
++            aspect_ratio = math.exp(random.uniform(*self.log_aspect_ratio))
++            h = int(round(math.sqrt(target_area * aspect_ratio)))
++            w = int(round(math.sqrt(target_area / aspect_ratio)))
++            if w >= self.width or h >= self.height:
++                continue
++
++            # Saliency-weighted placement: draw a handful of candidate (top,left)
++            # positions uniformly, then pick one weighted by _block_weight rather
++            # than accepting the first uniform draw unconditionally (what the
++            # base class does) -- cheap since the grid is tiny (e.g. 8x8).
++            candidates = [
++                (random.randint(0, self.height - h), random.randint(0, self.width - w))
++                for _ in range(self.n_candidates)
++            ]
++            weights = np.array([self._block_weight(t, l, h, w) for t, l in candidates], dtype=np.float64)
++            weights = weights + 1e-6  # keep every candidate reachable even at weight 0
++            weights /= weights.sum()
++            top, left = candidates[np.random.choice(len(candidates), p=weights)]
++
++            num_masked = mask[top : top + h, left : left + w].sum()
++            if 0 < h * w - num_masked <= max_mask_patches:
++                for i in range(top, top + h):
++                    for j in range(left, left + w):
++                        if mask[i, j] == 0:
++                            mask[i, j] = 1
++                            delta += 1
++            if delta > 0:
++                break
++        return delta
+diff --git a/dinov3/train/ssl_meta_arch.py b/dinov3/train/ssl_meta_arch.py
+index f42bed1..e31e676 100644
+--- a/dinov3/train/ssl_meta_arch.py
++++ b/dinov3/train/ssl_meta_arch.py
+@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
+ from torch import Tensor, nn
+ 
+ import dinov3.distributed as distributed
+-from dinov3.checkpointer import init_fsdp_model_from_checkpoint
++from dinov3.checkpointer import init_fsdp_backbone_from_pretrained, init_fsdp_model_from_checkpoint
+ from dinov3.configs import get_default_config
+ from dinov3.data import DataAugmentationDINO
+ from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
+@@ -146,6 +146,26 @@ class SSLMetaArch(nn.Module):
+         self.dino_koleo_loss_weight = self.cfg.dino.koleo_loss_weight
+         self.ibot_loss_weight = self.cfg.ibot.loss_weight
+ 
++        # ibot_local: masked-patch prediction on local (native-resolution) crops,
++        # guided by per-crop saliency (see dinov3/data/masking.py's
++        # MotionGuidedMaskingGenerator, dinov3/data/collate.py). Off by default;
++        # reuses the SAME ibot_head/ibot_patch_loss built above for global
++        # crops rather than a second head, per this project's convention of
++        # not duplicating trainable modules that share the same target space
++        # (teacher patch-token features from the same backbone).
++        self.ibot_local_enabled = self.cfg.ibot_local.enabled
++        self.ibot_local_loss_weight = self.cfg.ibot_local.loss_weight
++        if self.ibot_local_enabled:
++            logger.info("OPTIONS -- IBOT_LOCAL")
++            logger.info(f"OPTIONS -- IBOT_LOCAL -- loss_weight: {cfg.ibot_local.loss_weight}")
++            logger.info(f"OPTIONS -- IBOT_LOCAL -- direction: {cfg.ibot_local.direction}")
++            assert 0 <= cfg.ibot_local.mask_ratio_min_max[0] < cfg.ibot_local.mask_ratio_min_max[1] <= 1, (
++                "provide a valid cfg.ibot_local.mask_ratio_min_max"
++            )
++            assert 0 <= cfg.ibot_local.mask_sample_probability <= 1, (
++                "provide a positive mask probability for ibot_local"
++            )
++
+         # Local loss reweighting
+         if self.cfg.dino.reweight_dino_local_loss:
+             iter_per_epoch = cfg.train.OFFICIAL_EPOCH_LENGTH
+@@ -300,6 +320,15 @@ class SSLMetaArch(nn.Module):
+     def init_weights(self) -> None:
+         # All weights are set to `nan` to ensure we initialize everything explicitly
+         self.student.backbone.init_weights()
++        # DAPT: initialize student backbone from a released DINOv3 backbone checkpoint
++        # (bare backbone, no SSL heads). Heads keep fresh init; teacher copies below.
++        if getattr(self.cfg.student, "pretrained_weights", ""):
++            init_fsdp_backbone_from_pretrained(
++                self.student.backbone,
++                self.cfg.student.pretrained_weights,
++                keys_not_sharded=["rope_embed.periods", "qkv.bias_mask"],
++                process_group=distributed.get_process_subgroup(),
++            )
+         self.student.dino_head.init_weights()
+         self.student.ibot_head.init_weights()
+         self.dino_loss.init_weights()
+@@ -373,6 +402,17 @@ class SSLMetaArch(nn.Module):
+         masks_weight = data["masks_weight"].cuda(non_blocking=True)
+         n_masked_patches_tensor = data["n_masked_patches"].cuda(non_blocking=True)
+ 
++        if self.ibot_local_enabled:
++            local_masks = data["collated_local_masks"].cuda(non_blocking=True)
++            local_mask_indices_list = data["local_mask_indices_list"].cuda(non_blocking=True)
++            local_masks_weight = data["local_masks_weight"].cuda(non_blocking=True)
++            n_masked_local_patches_tensor = data["n_masked_local_patches"].cuda(non_blocking=True)
++        else:
++            local_masks = None
++            local_mask_indices_list = None
++            local_masks_weight = None
++            n_masked_local_patches_tensor = None
++
+         if self.has_gram_teacher:
+             assert "collated_gram_teacher_crops" in data, (
+                 "no gram teacher crops in the data, have you set cfg.crops.gram_teacher_crops_size?"
+@@ -390,6 +430,16 @@ class SSLMetaArch(nn.Module):
+             upperbound=data["upperbound"],
+         )
+ 
++        if self.ibot_local_enabled:
++            teacher_local = self.get_teacher_output_local(
++                local_crops.unflatten(0, (n_local_crops, B)),
++                teacher_temp=teacher_temp,
++                n_masked_patches_tensor=n_masked_local_patches_tensor,
++                mask_indices_list=local_mask_indices_list,
++            )
++        else:
++            teacher_local = {}
++
+         # Student output (will trigger an all-gather to unshard)
+         student_global, student_local = self.get_student_output(
+             global_crops=global_crops.unflatten(0, (n_global_crops, B)),
+@@ -397,6 +447,8 @@ class SSLMetaArch(nn.Module):
+             upperbound=data["upperbound"],
+             masks=masks,
+             mask_indices_list=mask_indices_list,
++            local_masks=local_masks,
++            local_mask_indices_list=local_mask_indices_list,
+         )
+ 
+         # Gram output
+@@ -421,6 +473,10 @@ class SSLMetaArch(nn.Module):
+             mask_indices_list=mask_indices_list,
+             masks_weight=masks_weight,
+             iteration=iteration,
++            teacher_local=teacher_local,
++            local_masks=local_masks,
++            local_mask_indices_list=local_mask_indices_list,
++            local_masks_weight=local_masks_weight,
+         )
+ 
+         self.backprop_loss(loss_accumulator)
+@@ -473,6 +529,40 @@ class SSLMetaArch(nn.Module):
+             "masked_patch_centered": masked_patch_centered,  # [n_masked_patches, K]
+         }
+ 
++    @torch.no_grad()
++    def get_teacher_output_local(
++        self,
++        local_crops,
++        *,
++        mask_indices_list,
++        teacher_temp,
++        n_masked_patches_tensor,
++    ):
++        # ibot_local: teacher forward pass on LOCAL crops (the stock recipe
++        # never does this -- teacher only ever sees global crops, see
++        # get_teacher_output above). Only the ibot_head + Sinkhorn-Knopp
++        # centering are needed here (reusing both from the global path, no
++        # new modules): local crops don't participate in a separate DINO
++        # cls-token loss on the teacher side, that's already covered by
++        # dino_local_crops_loss in compute_losses (student(local) vs
++        # teacher(global)).
++        n_crops, B, rgb, H, W = local_crops.shape
++        images = local_crops.flatten(0, 1)
++
++        backbone_out = self.teacher.backbone(images, is_training=True)
++        ibot_patch = backbone_out["x_norm_patchtokens"]  # [n_crops * B, P, D]
++
++        buffer = torch.index_select(ibot_patch.flatten(0, 1), dim=0, index=mask_indices_list)
++        masked_patch_after_head = self.teacher.ibot_head(buffer)
++
++        masked_patch_centered = self.ibot_patch_loss.sinkhorn_knopp_teacher(
++            masked_patch_after_head,
++            teacher_temp=teacher_temp,
++            n_masked_patches_tensor=n_masked_patches_tensor,
++        )  # [n_masked_local_patches, K]
++
++        return {"masked_patch_centered": masked_patch_centered}
++
+     def get_gram_teacher_output(self, images, *, masks, teacher_global, student_global, student_global_crops_size):
+         # Get student patch features
+         student_patches = student_global["patch_pre_head"].flatten(0, 1)  # [n_crops * B, P, D]
+@@ -527,16 +617,27 @@ class SSLMetaArch(nn.Module):
+             "orig_teacher_patches": orig_teacher_patches,  # [n_crops * B, P, D]
+         }
+ 
+-    def get_student_output(self, *, global_crops, local_crops, upperbound, masks, mask_indices_list):
++    def get_student_output(
++        self, *, global_crops, local_crops, upperbound, masks, mask_indices_list,
++        local_masks=None, local_mask_indices_list=None,
++    ):
+         n_global_crops, B, rgb, H, W = global_crops.shape
+         n_local_crops, B, rgb, H, W = local_crops.shape
+ 
+         global_crops = global_crops.flatten(0, 1)
+ 
++        # ibot_local: local_masks (from collate.py's collated_local_masks,
++        # None unless cfg.ibot_local.enabled) replaces the hardcoded `None`
++        # this second backbone.forward_features_list stream used to always
++        # get -- see dinov3/models/vision_transformer.py's
++        # prepare_tokens_with_masks, which is already generic over any
++        # per-stream mask/token-grid, so no backbone change is needed here.
++        local_masks_for_backbone = local_masks if not self.is_distillation_enabled else None
++
+         # Forward global and local crops through the student backbone jointly
+         global_out, local_out = self.student.backbone(
+             [global_crops, local_crops.flatten(0, 1)],
+-            masks=[masks if not self.is_distillation_enabled else None, None],
++            masks=[masks if not self.is_distillation_enabled else None, local_masks_for_backbone],
+             is_training=True,
+         )
+         g_cls, g_reg, g_patch = (
+@@ -554,6 +655,12 @@ class SSLMetaArch(nn.Module):
+         masked_patches_pre_head = torch.index_select(g_patch.flatten(0, 1), dim=0, index=mask_indices_list)
+         global_masked_patch_after_head = self.student.ibot_head(masked_patches_pre_head)
+ 
++        if local_mask_indices_list is not None:
++            local_masked_patches_pre_head = torch.index_select(
++                l_patch.flatten(0, 1), dim=0, index=local_mask_indices_list
++            )
++            local_masked_patch_after_head = self.student.ibot_head(local_masked_patches_pre_head)
++
+         # DINO head on CLS tokens (all in one pass)
+         buffer = [
+             g_cls,  # [n_global_crops * B, D]
+@@ -578,6 +685,9 @@ class SSLMetaArch(nn.Module):
+             "patch_pre_head": l_patch.unflatten(0, [n_local_crops, B]),  # [n_local_crops, B, P, D]
+             "cls_after_head": buffer[1].unflatten(0, [n_local_crops, B]),  # [n_local_crops, B, K],
+         }
++        if local_mask_indices_list is not None:
++            local_out["masked_patch_after_head"] = local_masked_patch_after_head  # [n_masked_local_patches, K]
++            local_out["masked_patch_pre_head"] = local_masked_patches_pre_head  # [n_masked_local_patches, D]
+ 
+         return global_out, local_out
+ 
+@@ -592,6 +702,10 @@ class SSLMetaArch(nn.Module):
+         mask_indices_list,
+         masks_weight,
+         iteration,
++        teacher_local=None,
++        local_masks=None,
++        local_mask_indices_list=None,
++        local_masks_weight=None,
+     ):
+         n_global_crops = student_global["cls_after_head"].shape[0]
+         n_local_crops = student_local["cls_after_head"].shape[0]
+@@ -648,6 +762,24 @@ class SSLMetaArch(nn.Module):
+         loss_dict["ibot_loss"] = ibot_patch_loss
+         loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
+ 
++        # IBOT_LOCAL loss: same masked-patch-prediction objective as IBOT
++        # above, applied to local (native-resolution) crops instead, using
++        # the saliency-guided masks from MotionGuidedMaskingGenerator. Only
++        # computed when the batch actually carries masked local patches
++        # (n_masked_local_patches > 0) -- with a low local_mask_probability
++        # a given step can legitimately have zero, and forward_masked doesn't
++        # tolerate an empty target set.
++        if self.ibot_local_enabled and local_mask_indices_list is not None and local_mask_indices_list.numel() > 0:
++            ibot_local_patch_loss = self.ibot_patch_loss.forward_masked(
++                student_local["masked_patch_after_head"],
++                teacher_local["masked_patch_centered"],
++                student_masks_flat=local_masks,
++                n_masked_patches=local_mask_indices_list.shape[0],
++                masks_weight=local_masks_weight,
++            )
++            loss_dict["ibot_local_loss"] = ibot_local_patch_loss
++            loss_accumulator += self.ibot_local_loss_weight * ibot_local_patch_loss
++
+         # Gram loss
+         if self.gram_use_loss:
+             gram_loss = self.gram_loss(
+@@ -756,8 +888,12 @@ class SSLMetaArch(nn.Module):
+             local_crops_subset_of_global_crops=cfg.crops.localcrops_subset_of_globalcrops,
+             share_color_jitter=cfg.crops.share_color_jitter,
+             horizontal_flips=cfg.crops.horizontal_flips,
++            local_crops_native=cfg.crops.local_crops_native,
++            crop_sampler=cfg.crops.crop_sampler,
++            crop_sampler_temp=cfg.crops.crop_sampler_temp,
+             mean=cfg.crops.rgb_mean,
+             std=cfg.crops.rgb_std,
++            ibot_local_enabled=cfg.ibot_local.enabled,
+         )
+ 
+     def get_maybe_fused_params_for_submodel(self, m: nn.Module):
+diff --git a/dinov3/train/train.py b/dinov3/train/train.py
+index 95ab2e5..d2a55f5 100644
+--- a/dinov3/train/train.py
++++ b/dinov3/train/train.py
+@@ -35,6 +35,7 @@ from dinov3.data import (
+     make_dataset,
+     CombinedDataLoader,
+ )
++from dinov3.data.masking import MotionGuidedMaskingGenerator
+ from dinov3.logging import MetricLogger, setup_logging
+ from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
+ from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
+@@ -279,6 +280,20 @@ def build_data_loader_from_cfg(
+         max_num_patches=0.5 * img_size // patch_size * img_size // patch_size,
+     )
+ 
++    if cfg.ibot_local.enabled:
++        local_img_size = cfg.crops.local_crops_size
++        local_n_tokens = (local_img_size // patch_size) ** 2
++        local_mask_generator = MotionGuidedMaskingGenerator(
++            input_size=(local_img_size // patch_size, local_img_size // patch_size),
++            max_num_patches=0.5 * local_img_size // patch_size * local_img_size // patch_size,
++            direction=cfg.ibot_local.direction,
++            gamma=cfg.ibot_local.saliency_gamma,
++            n_candidates=cfg.ibot_local.n_candidates,
++        )
++    else:
++        local_n_tokens = None
++        local_mask_generator = None
++
+     if cfg.multidistillation.enabled:
+         assert cfg.multidistillation.global_batch_size % distributed.get_subgroup_size() == 0
+         local_batch_size = cfg.multidistillation.global_batch_size // distributed.get_subgroup_size()
+@@ -302,6 +317,10 @@ def build_data_loader_from_cfg(
+         mask_generator=mask_generator,
+         random_circular_shift=cfg.ibot.mask_random_circular_shift,
+         local_batch_size=local_batch_size,
++        local_mask_generator=local_mask_generator,
++        local_mask_ratio_tuple=cfg.ibot_local.mask_ratio_min_max if cfg.ibot_local.enabled else None,
++        local_mask_probability=cfg.ibot_local.mask_sample_probability if cfg.ibot_local.enabled else 0.0,
++        local_n_tokens=local_n_tokens,
+     )
+     batch_size = dataloader_batch_size_per_gpu
+     num_workers = cfg.train.num_workers
+diff --git a/_convert_hf_to_repo.py b/_convert_hf_to_repo.py
+new file mode 100644
+index 0000000..98b9e7c
+--- /dev/null
++++ b/_convert_hf_to_repo.py
+@@ -0,0 +1,66 @@
++"""Convert HF DINOv3 safetensors -> DINOv3 repo-format .pth for continued pretraining.
++
++Generic over arch (vits16 / vitb16 / ...). Validates by comparing CLS embeddings
++of the repo model (converted) vs the HF model on the same input.
++
++  python _convert_hf_to_repo.py --hub dinov3_vits16 --hf-dir <dir> --out <path>
++"""
++import argparse
++import sys
++sys.path.insert(0, ".")
++import torch
++from safetensors.torch import load_file
++from transformers import AutoModel
++
++
++def convert(hub, hf_dir, out):
++    repo_model = torch.hub.load(".", hub, source="local", pretrained=False).eval()
++    repo = repo_model.state_dict()
++    hf = load_file(f"{hf_dir}/model.safetensors")
++    o = {k: v.clone() for k, v in repo.items()}
++
++    o["cls_token"] = hf["embeddings.cls_token"]
++    o["storage_tokens"] = hf["embeddings.register_tokens"]
++    o["mask_token"] = hf["embeddings.mask_token"].reshape(repo["mask_token"].shape)
++    o["patch_embed.proj.weight"] = hf["embeddings.patch_embeddings.weight"]
++    o["patch_embed.proj.bias"] = hf["embeddings.patch_embeddings.bias"]
++    o["norm.weight"] = hf["norm.weight"]
++    o["norm.bias"] = hf["norm.bias"]
++
++    n = len({k.split(".")[1] for k in repo if k.startswith("blocks.")})
++    for i in range(n):
++        R, H = f"blocks.{i}.", f"layer.{i}."
++        o[R + "norm1.weight"] = hf[H + "norm1.weight"]; o[R + "norm1.bias"] = hf[H + "norm1.bias"]
++        o[R + "norm2.weight"] = hf[H + "norm2.weight"]; o[R + "norm2.bias"] = hf[H + "norm2.bias"]
++        qw, kw, vw = (hf[H + f"attention.{p}_proj.weight"] for p in ("q", "k", "v"))
++        o[R + "attn.qkv.weight"] = torch.cat([qw, kw, vw], 0)
++        qb, vb = hf[H + "attention.q_proj.bias"], hf[H + "attention.v_proj.bias"]
++        o[R + "attn.qkv.bias"] = torch.cat([qb, torch.zeros_like(qb), vb], 0)
++        o[R + "attn.proj.weight"] = hf[H + "attention.o_proj.weight"]; o[R + "attn.proj.bias"] = hf[H + "attention.o_proj.bias"]
++        o[R + "ls1.gamma"] = hf[H + "layer_scale1.lambda1"]; o[R + "ls2.gamma"] = hf[H + "layer_scale2.lambda1"]
++        o[R + "mlp.fc1.weight"] = hf[H + "mlp.up_proj.weight"]; o[R + "mlp.fc1.bias"] = hf[H + "mlp.up_proj.bias"]
++        o[R + "mlp.fc2.weight"] = hf[H + "mlp.down_proj.weight"]; o[R + "mlp.fc2.bias"] = hf[H + "mlp.down_proj.bias"]
++
++    repo_model.load_state_dict(o, strict=True)
++    hf_model = AutoModel.from_pretrained(hf_dir).eval()
++    torch.manual_seed(0)
++    x = torch.randn(2, 3, 224, 224)
++    with torch.no_grad():
++        feats = repo_model.forward_features(x)
++        rc = feats["x_norm_clstoken"] if isinstance(feats, dict) else feats
++        hc = hf_model(x).last_hidden_state[:, 0]
++    cos = torch.nn.functional.cosine_similarity(rc, hc, dim=-1)
++    print(f"{hub}: cosine(repo,hf)={cos.tolist()}")
++    if cos.min() > 0.98:
++        torch.save(o, out); print("VALID -> saved", out)
++    else:
++        print("MISMATCH -- not saving")
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--hub", default="dinov3_vits16")
++    ap.add_argument("--hf-dir", required=True)
++    ap.add_argument("--out", required=True)
++    a = ap.parse_args()
++    convert(a.hub, a.hf_dir, a.out)
+diff --git a/_extract_dapt_backbone_param.py b/_extract_dapt_backbone_param.py
+new file mode 100644
+index 0000000..07b0493
+--- /dev/null
++++ b/_extract_dapt_backbone_param.py
+@@ -0,0 +1,30 @@
++"""Parameterized version of _extract_dapt_backbone.py (from patches/dinov3_dapt.patch)
++-- extracts the TEACHER backbone (EMA'd, the usual choice for downstream eval per
++DINO/DINOv2/DINOv3 papers) from an official-trainer DCP checkpoint directory into
++a plain state_dict .pth, directly loadable by the benchmark repo's
++DINOv3FPN(which="dapt") via DINOV3_DAPT_B_WEIGHTS (no grayscale/fold conversion
++needed -- this checkpoint is already standard 3-channel architecture).
++
++  python _extract_dapt_backbone_param.py --ckpt <dir>/ckpt/2999 --out <path>.pth
++"""
++import argparse
++import torch
++from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--ckpt", required=True)
++ap.add_argument("--out", required=True)
++ap.add_argument("--tmp", default="/tmp/_extract_full.pth")
++a = ap.parse_args()
++
++dcp_to_torch_save(a.ckpt, a.tmp)
++sd = torch.load(a.tmp, map_location="cpu", weights_only=False)
++model_sd = sd["model"] if isinstance(sd, dict) and "model" in sd else sd
++
++prefixes = sorted({k.split(".backbone.")[0] + ".backbone." for k in model_sd if ".backbone." in k})
++print("backbone prefixes found:", prefixes)
++pref = "teacher.backbone." if any(p == "teacher.backbone." for p in prefixes) else prefixes[0]
++bb = {k[len(pref):]: v for k, v in model_sd.items() if k.startswith(pref)}
++print(f"using prefix '{pref}' -> {len(bb)} backbone tensors; sample: {list(bb)[:5]}")
++torch.save(bb, a.out)
++print("saved DAPT backbone ->", a.out)
+diff --git a/dinov3/configs/train/dapt_vitb16.yaml b/dinov3/configs/train/dapt_vitb16.yaml
+new file mode 100644
+index 0000000..40f5268
+--- /dev/null
++++ b/dinov3/configs/train/dapt_vitb16.yaml
+@@ -0,0 +1,46 @@
++# Official DINOv3 DAPT (DINO+iBOT+KoLeo) — ViT-B/16, continued pretraining from released weights.
++# Two-resolution training: global = resize (coarse whole-frame), local = NATIVE crop (fine detail).
++MODEL:
++  WEIGHTS: ''
++train:
++  dataset_path: Frames:root=/mnt/d/Video/domain_transfer/frames_hires/train
++  batch_size_per_gpu: 16            # A100-40GB can raise; local smoke keep small
++  OFFICIAL_EPOCH_LENGTH: 2500       # long run: epochs*this = total iters
++  num_workers: 8
++  compile: false
++  cudagraphs: false
++  centering: sinkhorn_knopp
++  saveckp_freq: 1
++  output_dir: /mnt/d/Video/domain_transfer/dinov3_dapt_vitb_run
++checkpointing:
++  period: 2500
++  max_to_keep: 3
++student:
++  arch: vit_base
++  patch_size: 16
++  pretrained_weights: /mnt/d/Video/domain_transfer/weights/dinov3_vitb16_repo.pth
++  n_storage_tokens: 4
++  mask_k_bias: true
++  norm_layer: layernormbf16
++  layerscale: 1.0e-05
++  drop_path_rate: 0.1
++  ffn_layer: mlp
++  pos_embed_type: rope
++  pos_embed_rope_base: 100.0
++  pos_embed_rope_normalize_coords: separate
++  pos_embed_rope_rescale_coords: 2
++  pos_embed_rope_dtype: fp32
++  fp8_enabled: false
++  in_chans: 3
++teacher:
++  in_chans: 3
++optim:
++  epochs: 8                          # long run: 8 * 2500 = 20000 iters
++  warmup_epochs: 1
++  freeze_last_layer_epochs: 1
++  lr: 1.0e-04
++crops:
++  local_crops_number: 8
++  global_crops_size: 224             # coarse: resized whole-frame view
++  local_crops_size: 128             # fine: NATIVE-resolution crop (no downscale)
++  local_crops_native: true
+diff --git a/dinov3/configs/train/dapt_vitb16_official_compare_adaptive.yaml b/dinov3/configs/train/dapt_vitb16_official_compare_adaptive.yaml
+new file mode 100644
+index 0000000..39fd1dd
+--- /dev/null
++++ b/dinov3/configs/train/dapt_vitb16_official_compare_adaptive.yaml
+@@ -0,0 +1,51 @@
++# "Official comparison" — ADAPTIVE arm (content-adaptive local-crop, adaptive_crop=true).
++# Paired 1:1 with dapt_vitb16_official_compare_base.yaml — identical in every
++# other hyperparameter; see that file's header comment for the schedule
++# rationale. Only the crops.adaptive_crop flag (and output_dir, so the two
++# runs don't clobber each other) differs.
++MODEL:
++  WEIGHTS: ''
++train:
++  dataset_path: Frames:root=/mnt/d/Video/domain_transfer/frames_hires/train
++  batch_size_per_gpu: 16
++  OFFICIAL_EPOCH_LENGTH: 500
++  num_workers: 4
++  compile: false
++  cudagraphs: false
++  centering: sinkhorn_knopp
++  saveckp_freq: 1
++  output_dir: /mnt/d/Video/domain_transfer/dinov3_dapt_official_compare_adaptive_out
++checkpointing:
++  period: 500
++  max_to_keep: 3
++student:
++  arch: vit_base
++  patch_size: 16
++  pretrained_weights: /mnt/d/Video/domain_transfer/weights/dinov3_vitb16_repo.pth
++  n_storage_tokens: 4
++  mask_k_bias: true
++  norm_layer: layernormbf16
++  layerscale: 1.0e-05
++  drop_path_rate: 0.1
++  ffn_layer: mlp
++  pos_embed_type: rope
++  pos_embed_rope_base: 100.0
++  pos_embed_rope_normalize_coords: separate
++  pos_embed_rope_rescale_coords: 2
++  pos_embed_rope_dtype: fp32
++  fp8_enabled: false
++  in_chans: 3
++teacher:
++  in_chans: 3
++optim:
++  epochs: 6                          # 6 * 500 = 3000 iters total
++  warmup_epochs: 1                   # 500-step warmup, then cosine decay over the rest
++  freeze_last_layer_epochs: 1
++  lr: 1.0e-04
++crops:
++  local_crops_number: 8
++  global_crops_size: 224
++  local_crops_size: 128
++  local_crops_native: true
++  crop_sampler: content               # <-- the ONE line that differs from the base config
++  crop_sampler_temp: 0.3
+diff --git a/dinov3/configs/train/dapt_vitb16_official_compare_base.yaml b/dinov3/configs/train/dapt_vitb16_official_compare_base.yaml
+new file mode 100644
+index 0000000..038301a
+--- /dev/null
++++ b/dinov3/configs/train/dapt_vitb16_official_compare_base.yaml
+@@ -0,0 +1,61 @@
++# "Official comparison" — BASELINE arm (uniform random local-crop, adaptive_crop=false).
++# Paired 1:1 with dapt_vitb16_official_compare_adaptive.yaml — every other
++# hyperparameter is IDENTICAL between the two; the only difference is the
++# `crops.adaptive_crop` flag. This is the controlled A/B for the paper's
++# core claim, run entirely on the official DINOv3 trainer (not the project's
++# own custom/fragile 40_dinov3_dapt.py).
++#
++# Schedule note: the earlier smoke test used optim.epochs=1, which squeezes
++# the whole warmup+cosine-decay schedule into 300 steps and decays LR to ~0
++# almost immediately (lr printed as 0.0000 throughout) -- fine for a pure
++# "does it crash" check, useless for judging whether training actually learns
++# anything. Here epochs=6 (OFFICIAL_EPOCH_LENGTH=500 -> 3000 total iters) with
++# warmup_epochs=1 gives the schedule room to behave like a real (if short)
++# training run: 500-step warmup, then 2500 steps of cosine decay.
++#
++# ~3000 iters @ ~1s/it (ViT-B, batch=16, measured in the smoke test) -> ~50min.
++MODEL:
++  WEIGHTS: ''
++train:
++  dataset_path: Frames:root=/mnt/d/Video/domain_transfer/frames_hires/train
++  batch_size_per_gpu: 16
++  OFFICIAL_EPOCH_LENGTH: 500
++  num_workers: 4
++  compile: false
++  cudagraphs: false
++  centering: sinkhorn_knopp
++  saveckp_freq: 1
++  output_dir: /mnt/d/Video/domain_transfer/dinov3_dapt_official_compare_base_out
++checkpointing:
++  period: 500
++  max_to_keep: 3
++student:
++  arch: vit_base
++  patch_size: 16
++  pretrained_weights: /mnt/d/Video/domain_transfer/weights/dinov3_vitb16_repo.pth
++  n_storage_tokens: 4
++  mask_k_bias: true
++  norm_layer: layernormbf16
++  layerscale: 1.0e-05
++  drop_path_rate: 0.1
++  ffn_layer: mlp
++  pos_embed_type: rope
++  pos_embed_rope_base: 100.0
++  pos_embed_rope_normalize_coords: separate
++  pos_embed_rope_rescale_coords: 2
++  pos_embed_rope_dtype: fp32
++  fp8_enabled: false
++  in_chans: 3
++teacher:
++  in_chans: 3
++optim:
++  epochs: 6                          # 6 * 500 = 3000 iters total
++  warmup_epochs: 1                   # 500-step warmup, then cosine decay over the rest
++  freeze_last_layer_epochs: 1
++  lr: 1.0e-04
++crops:
++  local_crops_number: 8
++  global_crops_size: 224
++  local_crops_size: 128
++  local_crops_native: true
++  crop_sampler: uniform               # <-- the ONE line that differs from the content-adaptive config
+diff --git a/dinov3/configs/train/dapt_vitb16_official_compare_motion.yaml b/dinov3/configs/train/dapt_vitb16_official_compare_motion.yaml
+new file mode 100644
+index 0000000..b5387c3
+--- /dev/null
++++ b/dinov3/configs/train/dapt_vitb16_official_compare_motion.yaml
+@@ -0,0 +1,55 @@
++# "Official comparison" — MOTION arm (motion-energy-guided local-crop).
++# Third leg of the E1 three-arm ablation, paired 1:1 with
++# dapt_vitb16_official_compare_base.yaml (uniform) and
++# dapt_vitb16_official_compare_adaptive.yaml (content) -- identical in every
++# other hyperparameter; see base config's header for the schedule rationale.
++# Only crop_sampler (and output_dir, so the three runs don't clobber each
++# other) differs. Uses real .me.png sidecars from scripts/12_motion_energy.py
++# (2851/2925 videos, ~97.5% coverage -- the ~2.5% without a sidecar fall back
++# to uniform for those specific frames, per crop_sampler.py's own design).
++MODEL:
++  WEIGHTS: ''
++train:
++  dataset_path: Frames:root=/mnt/d/Video/domain_transfer/frames_hires/train
++  batch_size_per_gpu: 16
++  OFFICIAL_EPOCH_LENGTH: 500
++  num_workers: 4
++  compile: false
++  cudagraphs: false
++  centering: sinkhorn_knopp
++  saveckp_freq: 1
++  output_dir: /mnt/d/Video/domain_transfer/dinov3_dapt_official_compare_motion_out
++checkpointing:
++  period: 500
++  max_to_keep: 3
++student:
++  arch: vit_base
++  patch_size: 16
++  pretrained_weights: /mnt/d/Video/domain_transfer/weights/dinov3_vitb16_repo.pth
++  n_storage_tokens: 4
++  mask_k_bias: true
++  norm_layer: layernormbf16
++  layerscale: 1.0e-05
++  drop_path_rate: 0.1
++  ffn_layer: mlp
++  pos_embed_type: rope
++  pos_embed_rope_base: 100.0
++  pos_embed_rope_normalize_coords: separate
++  pos_embed_rope_rescale_coords: 2
++  pos_embed_rope_dtype: fp32
++  fp8_enabled: false
++  in_chans: 3
++teacher:
++  in_chans: 3
++optim:
++  epochs: 6                          # 6 * 500 = 3000 iters total
++  warmup_epochs: 1                   # 500-step warmup, then cosine decay over the rest
++  freeze_last_layer_epochs: 1
++  lr: 1.0e-04
++crops:
++  local_crops_number: 8
++  global_crops_size: 224
++  local_crops_size: 128
++  local_crops_native: true
++  crop_sampler: motion                # <-- the ONE line that differs from the base config
++  crop_sampler_temp: 0.3
+diff --git a/dinov3/configs/train/dapt_vitb16_official_compare_motion_ibotlocal_high.yaml b/dinov3/configs/train/dapt_vitb16_official_compare_motion_ibotlocal_high.yaml
+new file mode 100644
+index 0000000..23b3e5f
+--- /dev/null
++++ b/dinov3/configs/train/dapt_vitb16_official_compare_motion_ibotlocal_high.yaml
+@@ -0,0 +1,71 @@
++# "Official comparison" — MOTION + IBOT_LOCAL (mask_high_saliency) arm.
++# Adds masked-patch prediction on LOCAL (native-resolution) crops, guided by
++# the same motion-energy signal already driving the motion crop_sampler's
++# spatial arm (dinov3/data/masking.py's MotionGuidedMaskingGenerator) --
++# see SESSION_NOTES_motion_energy_e1.md's literature-driven pivot: the
++# resolution-bottleneck diagnosis (needle_tip ≈1.3 patch16 tokens tall) means
++# spatial crop placement alone can't help, but a masked-prediction objective
++# scoped to the native-resolution local crops directly supervises exactly the
++# fine/thin structures the coarse global-crop-only pretraining under-encodes.
++# direction=mask_high_saliency (AttMask, ECCV'22): hide the motion-salient
++# (high-motion-energy) regions harder, forcing the model to predict them
++# precisely -- this is the "sharper small-object representation" arm of the
++# A/B; see the other file (..._ibotlocal_low.yaml) for the opposite direction
++# (MotionMAE/V-JEPA4A's "keep salient regions as context" convention).
++# Otherwise identical to dapt_vitb16_official_compare_motion.yaml.
++MODEL:
++  WEIGHTS: ''
++train:
++  dataset_path: Frames:root=/mnt/d/Video/domain_transfer/frames_hires/train
++  batch_size_per_gpu: 16
++  OFFICIAL_EPOCH_LENGTH: 500
++  num_workers: 4
++  compile: false
++  cudagraphs: false
++  centering: sinkhorn_knopp
++  saveckp_freq: 1
++  output_dir: /mnt/d/Video/domain_transfer/dinov3_dapt_official_compare_motion_ibotlocal_high_out
++checkpointing:
++  period: 500
++  max_to_keep: 3
++student:
++  arch: vit_base
++  patch_size: 16
++  pretrained_weights: /mnt/d/Video/domain_transfer/weights/dinov3_vitb16_repo.pth
++  n_storage_tokens: 4
++  mask_k_bias: true
++  norm_layer: layernormbf16
++  layerscale: 1.0e-05
++  drop_path_rate: 0.1
++  ffn_layer: mlp
++  pos_embed_type: rope
++  pos_embed_rope_base: 100.0
++  pos_embed_rope_normalize_coords: separate
++  pos_embed_rope_rescale_coords: 2
++  pos_embed_rope_dtype: fp32
++  fp8_enabled: false
++  in_chans: 3
++teacher:
++  in_chans: 3
++optim:
++  epochs: 6                          # 6 * 500 = 3000 iters total
++  warmup_epochs: 1
++  freeze_last_layer_epochs: 1
++  lr: 1.0e-04
++crops:
++  local_crops_number: 8
++  global_crops_size: 224
++  local_crops_size: 128
++  local_crops_native: true
++  crop_sampler: motion
++  crop_sampler_temp: 0.3
++ibot_local:
++  enabled: true
++  loss_weight: 1.0
++  mask_sample_probability: 0.5
++  mask_ratio_min_max:
++  - 0.1
++  - 0.5
++  direction: mask_high_saliency
++  saliency_gamma: 1.0
++  n_candidates: 6
+diff --git a/dinov3/configs/train/dapt_vitb16_official_compare_motion_ibotlocal_low.yaml b/dinov3/configs/train/dapt_vitb16_official_compare_motion_ibotlocal_low.yaml
+new file mode 100644
+index 0000000..f6d5651
+--- /dev/null
++++ b/dinov3/configs/train/dapt_vitb16_official_compare_motion_ibotlocal_low.yaml
+@@ -0,0 +1,72 @@
++# "Official comparison" — MOTION + IBOT_LOCAL (mask_low_saliency) arm.
++# Adds masked-patch prediction on LOCAL (native-resolution) crops, guided by
++# the same motion-energy signal already driving the motion crop_sampler's
++# spatial arm (dinov3/data/masking.py's MotionGuidedMaskingGenerator) --
++# see SESSION_NOTES_motion_energy_e1.md's literature-driven pivot: the
++# resolution-bottleneck diagnosis (needle_tip ≈1.3 patch16 tokens tall) means
++# spatial crop placement alone can't help, but a masked-prediction objective
++# scoped to the native-resolution local crops directly supervises exactly the
++# fine/thin structures the coarse global-crop-only pretraining under-encodes.
++# direction=mask_low_saliency (MotionMAE/V-JEPA4A, ICCV'23/GCPR'26): keep the
++# motion-salient regions visible as context, mask the background instead --
++# the opposite arm of the A/B from ..._ibotlocal_high.yaml (AttMask, ECCV'22,
++# which masks the salient regions harder to force precise reconstruction).
++# Which direction actually helps needle_tip/benchmark performance is exactly
++# the open question this A/B is designed to resolve empirically.
++# Otherwise identical to dapt_vitb16_official_compare_motion.yaml.
++MODEL:
++  WEIGHTS: ''
++train:
++  dataset_path: Frames:root=/mnt/d/Video/domain_transfer/frames_hires/train
++  batch_size_per_gpu: 16
++  OFFICIAL_EPOCH_LENGTH: 500
++  num_workers: 4
++  compile: false
++  cudagraphs: false
++  centering: sinkhorn_knopp
++  saveckp_freq: 1
++  output_dir: /mnt/d/Video/domain_transfer/dinov3_dapt_official_compare_motion_ibotlocal_low_out
++checkpointing:
++  period: 500
++  max_to_keep: 3
++student:
++  arch: vit_base
++  patch_size: 16
++  pretrained_weights: /mnt/d/Video/domain_transfer/weights/dinov3_vitb16_repo.pth
++  n_storage_tokens: 4
++  mask_k_bias: true
++  norm_layer: layernormbf16
++  layerscale: 1.0e-05
++  drop_path_rate: 0.1
++  ffn_layer: mlp
++  pos_embed_type: rope
++  pos_embed_rope_base: 100.0
++  pos_embed_rope_normalize_coords: separate
++  pos_embed_rope_rescale_coords: 2
++  pos_embed_rope_dtype: fp32
++  fp8_enabled: false
++  in_chans: 3
++teacher:
++  in_chans: 3
++optim:
++  epochs: 6                          # 6 * 500 = 3000 iters total
++  warmup_epochs: 1
++  freeze_last_layer_epochs: 1
++  lr: 1.0e-04
++crops:
++  local_crops_number: 8
++  global_crops_size: 224
++  local_crops_size: 128
++  local_crops_native: true
++  crop_sampler: motion
++  crop_sampler_temp: 0.3
++ibot_local:
++  enabled: true
++  loss_weight: 1.0
++  mask_sample_probability: 0.5
++  mask_ratio_min_max:
++  - 0.1
++  - 0.5
++  direction: mask_low_saliency
++  saliency_gamma: 1.0
++  n_candidates: 6
+diff --git a/dinov3/configs/train/dapt_vitb16_official_compare_motion_weighted.yaml b/dinov3/configs/train/dapt_vitb16_official_compare_motion_weighted.yaml
+new file mode 100644
+index 0000000..7b05680
+--- /dev/null
++++ b/dinov3/configs/train/dapt_vitb16_official_compare_motion_weighted.yaml
+@@ -0,0 +1,54 @@
++# "Official comparison" — MOTION + TEMPORAL-WEIGHTED arm. Adds frame-level
++# importance weighting (scripts/13_frame_weights.py, extra=weighted) on top
++# of the motion crop_sampler (spatial) arm -- see session discussion: uniform
++# frame sampling under-represents the brief, information-dense moments
++# (needle-tissue interaction) within long procedure videos, which may be why
++# the plain motion arm regressed on needle_tip despite improving elsewhere.
++# Otherwise identical to dapt_vitb16_official_compare_motion.yaml; only
++# dataset_path's extra=weighted (and output_dir) differ.
++MODEL:
++  WEIGHTS: ''
++train:
++  dataset_path: Frames:root=/mnt/d/Video/domain_transfer/frames_hires/train:extra=weighted
++  batch_size_per_gpu: 16
++  OFFICIAL_EPOCH_LENGTH: 500
++  num_workers: 4
++  compile: false
++  cudagraphs: false
++  centering: sinkhorn_knopp
++  saveckp_freq: 1
++  output_dir: /mnt/d/Video/domain_transfer/dinov3_dapt_official_compare_motion_weighted_out
++checkpointing:
++  period: 500
++  max_to_keep: 3
++student:
++  arch: vit_base
++  patch_size: 16
++  pretrained_weights: /mnt/d/Video/domain_transfer/weights/dinov3_vitb16_repo.pth
++  n_storage_tokens: 4
++  mask_k_bias: true
++  norm_layer: layernormbf16
++  layerscale: 1.0e-05
++  drop_path_rate: 0.1
++  ffn_layer: mlp
++  pos_embed_type: rope
++  pos_embed_rope_base: 100.0
++  pos_embed_rope_normalize_coords: separate
++  pos_embed_rope_rescale_coords: 2
++  pos_embed_rope_dtype: fp32
++  fp8_enabled: false
++  in_chans: 3
++teacher:
++  in_chans: 3
++optim:
++  epochs: 6                          # 6 * 500 = 3000 iters total
++  warmup_epochs: 1
++  freeze_last_layer_epochs: 1
++  lr: 1.0e-04
++crops:
++  local_crops_number: 8
++  global_crops_size: 224
++  local_crops_size: 128
++  local_crops_native: true
++  crop_sampler: motion
++  crop_sampler_temp: 0.3
+diff --git a/dinov3/data/adaptive_crop.py b/dinov3/data/adaptive_crop.py
+new file mode 100644
+index 0000000..4d2dd58
+--- /dev/null
++++ b/dinov3/data/adaptive_crop.py
+@@ -0,0 +1,185 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# Shared low-level primitives for content-adaptive local-crop position sampling:
++# scoring (content_score) and sequential-suppression sampling given ANY score map
++# (sample_positions_from_score). See crop_sampler.py for the CropSampler protocol
++# that wraps these into the uniform/content/motion arms used by --crop-sampler.
++#
++# Self-contained port of domain_transfer/scripts/structure_score.py (see that
++# file for the full design writeup/citations) — duplicated here rather than
++# imported cross-repo so this patched dinov3 checkout has no dependency on the
++# sibling project's path.
++#
++# `sample_positions_from_score` is deliberately the SAME function for both the
++# content arm (score = structure-tensor/top-hat) and the motion arm (score =
++# frame-difference energy, see 12_motion_energy.py) — the E1 ablation's internal
++# validity depends on temperature, boundary handling and overlap-suppression
++# being byte-identical across arms, with the score map as the ONLY thing that
++# differs (see IVF_FOUNDATION_PATENT_PLAN.md §2).
++#
++# Hard-timeout + exception fallback: a corrupted/pathological image should
++# degrade to a uniform random crop, never hang or crash the DataLoader worker
++# (a real GCP incident: some malformed JPEGs cause libjpeg-level hangs that a
++# plain try/except cannot catch since no exception is ever raised).
++
++from __future__ import annotations
++
++import logging
++import signal
++
++import cv2
++import numpy as np
++import torch
++from PIL import ImageOps
++from torchvision.transforms import functional as TF
++
++cv2.setNumThreads(0)  # avoid the classic cv2-internal-threads + fork deadlock
++
++logger = logging.getLogger("dinov3")
++
++TIMEOUT_SEC = 10
++
++
++class ScoringTimeout(Exception):
++    pass
++
++
++def _alarm_handler(signum, frame):
++    raise ScoringTimeout(f"exceeded {TIMEOUT_SEC}s")
++
++
++class time_limit:
++    def __enter__(self):
++        signal.signal(signal.SIGALRM, _alarm_handler)
++        signal.alarm(TIMEOUT_SEC)
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        signal.alarm(0)
++        return False
++
++
++def content_score(gray_u8, tophat_scales=(5, 9, 17), st_sigma=2.0):
++    """Multi-scale morphological top-hat/black-hat ("is this region separable
++    from its neighborhood") x structure-tensor anisotropy ("is it a thin 1D
++    structure, not a 2D blob") -> per-pixel score map, normalized to [0,1]."""
++    img = gray_u8.astype(np.float32)
++    tophat = np.zeros_like(img)
++    for k in tophat_scales:
++        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
++        wth = cv2.morphologyEx(gray_u8, cv2.MORPH_TOPHAT, se).astype(np.float32)
++        bth = cv2.morphologyEx(gray_u8, cv2.MORPH_BLACKHAT, se).astype(np.float32)
++        tophat = np.maximum(tophat, np.maximum(wth, bth))
++
++    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
++    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
++    Ixx = cv2.GaussianBlur(gx * gx, (0, 0), st_sigma)
++    Iyy = cv2.GaussianBlur(gy * gy, (0, 0), st_sigma)
++    Ixy = cv2.GaussianBlur(gx * gy, (0, 0), st_sigma)
++    tr = Ixx + Iyy
++    disc = np.sqrt(np.maximum(((Ixx - Iyy) / 2.0) ** 2 + Ixy ** 2, 0.0))
++    lam_max = tr / 2.0 + disc
++    lam_min = tr / 2.0 - disc
++    anisotropy = (lam_max - lam_min) / (lam_max + lam_min + 1e-6)
++
++    score = tophat * anisotropy
++    denom = score.max()
++    if denom > 1e-6:
++        score = score / denom
++    return score.astype(np.float32)
++
++
++def _sliding_window_max(score, size, stride):
++    H, W = score.shape
++    max_top, max_left = H - size, W - size
++    if max_top < 0 or max_left < 0:
++        return [(0, 0)], np.array([float(score.max())], dtype=np.float32)
++    dil = cv2.dilate(score, np.ones((1, size), dtype=np.uint8))
++    dil = cv2.dilate(dil, np.ones((size, 1), dtype=np.uint8))
++    half = size // 2
++    tops = list(range(0, max_top + 1, stride)) or [0]
++    lefts = list(range(0, max_left + 1, stride)) or [0]
++    cand, vals = [], []
++    for t in tops:
++        for l in lefts:
++            cy = min(t + half, H - 1)
++            cx = min(l + half, W - 1)
++            cand.append((t, l))
++            vals.append(dil[cy, cx])
++    return cand, np.asarray(vals, dtype=np.float32)
++
++
++def sample_positions_from_score(score, size, n_crops, temperature=0.3,
++                                 stride_frac=1 / 8, suppress_radius_frac=0.75):
++    """score: 2D float array (H,W), any non-negative scale (need not be [0,1]).
++    Returns n_crops (top,left) positions via sequential-suppression sampling:
++    draw one from softmax(score/temperature) over sliding-window-max candidates,
++    suppress candidates within suppress_radius of it, renormalize, repeat — so
++    the n_crops draws land on distinct hotspots (if the image has more than
++    one) rather than clustering on a single one. Falls back to allowing overlap
++    once candidate probability mass is exhausted (single dominant hotspot).
++
++    Shared by ContentCropSampler and MotionCropSampler (crop_sampler.py) — the
++    ONLY thing that should differ between those two arms is what `score` is,
++    not how positions get drawn from it.
++    """
++    stride = max(1, int(size * stride_frac))
++    cand, vals = _sliding_window_max(score, size, stride)
++
++    vals = vals - vals.max()
++    base_probs = np.exp(vals / max(temperature, 1e-3))
++    base_probs = base_probs / base_probs.sum()
++    centers = np.array([(t + size / 2.0, l + size / 2.0) for t, l in cand])
++    suppress_radius = suppress_radius_frac * size
++
++    avail = base_probs.copy()
++    chosen = []
++    for _ in range(n_crops):
++        if avail.sum() <= 1e-8:
++            avail = base_probs.copy()  # hotspots exhausted -> allow overlap
++        p = avail / avail.sum()
++        idx = np.random.choice(len(cand), p=p)
++        chosen.append(cand[idx])
++        dist = np.linalg.norm(centers - centers[idx], axis=1)
++        avail = avail * (dist > suppress_radius)
++    return chosen
++
++
++def pad_if_needed(image, size):
++    """Right/bottom zero-pad so both dims are >= size. Returns the (possibly
++    unchanged) image."""
++    w, h = image.size
++    pad_w, pad_h = max(0, size - w), max(0, size - h)
++    if pad_w or pad_h:
++        image = ImageOps.expand(image, border=(0, 0, pad_w, pad_h), fill=0)
++    return image
++
++
++def crop_at_positions(image, size, positions):
++    return [TF.crop(image, t, l, size, size) for (t, l) in positions]
++
++
++def uniform_positions(image, size, n_crops):
++    w, h = image.size
++    return [(int(torch.randint(0, max(1, h - size + 1), (1,)).item()),
++             int(torch.randint(0, max(1, w - size + 1), (1,)).item()))
++            for _ in range(n_crops)]
++
++
++def adaptive_crop_positions(image, size, n_crops, temperature=0.3,
++                             stride_frac=1 / 8, suppress_radius_frac=0.75):
++    """Back-compat wrapper (content-only) — prefer crop_sampler.ContentCropSampler
++    for new code. image: PIL image (any mode, e.g. RGB — cropping happens on the
++    original image, scoring uses a grayscale view of it). Returns n_crops PIL
++    crops of size (size,size)."""
++    image = pad_if_needed(image, size)
++    try:
++        with time_limit():
++            gray = np.array(image.convert("L"))
++            score = content_score(gray)
++            chosen = sample_positions_from_score(
++                score, size, n_crops, temperature, stride_frac, suppress_radius_frac)
++    except Exception as e:
++        logger.warning(f"[adaptive_crop] scoring failed/timed out ({e}); "
++                        f"falling back to uniform random crop for this image")
++        chosen = uniform_positions(image, size, n_crops)
++    return crop_at_positions(image, size, chosen)
+diff --git a/dinov3/data/crop_sampler.py b/dinov3/data/crop_sampler.py
+new file mode 100644
+index 0000000..22e8aef
+--- /dev/null
++++ b/dinov3/data/crop_sampler.py
+@@ -0,0 +1,140 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# CropSampler: the three-arm abstraction for E1 (uniform / content / motion).
++# See IVF_FOUNDATION_PATENT_PLAN.md §2 for the rationale — in short: this
++# project already had a non-random, content-driven crop sampler
++# (ContentCropSampler, ported from structure_score.py) before the motion-guided
++# one existed, and content-driven proposal heads are prior art the patent's
++# claims need to be distinguished from. So E1 is a THREE-arm comparison, not
++# two, and all three MUST share every mechanic except the score map itself
++# (temperature softmax, sliding-window-max candidate scoring, sequential-
++# suppression sampling, boundary padding) — otherwise a difference between arms
++# could be an artifact of the harness rather than of what the score measures,
++# which would be fatal to both the ablation's internal validity and to any
++# claim of a technical effect in the patent.
++#
++# Usage: build_crop_sampler(name, temperature=...) -> CropSampler, then
++# augmentations.py calls sampler.sample(image, n_crops, size, meta) once per
++# image (meta currently only carries motion_energy_path, for the motion arm).
++
++from __future__ import annotations
++
++import logging
++import os
++from typing import Protocol
++
++import numpy as np
++from PIL import Image as PILImage
++
++from dinov3.data.adaptive_crop import (
++    content_score,
++    crop_at_positions,
++    pad_if_needed,
++    sample_positions_from_score,
++    time_limit,
++    uniform_positions,
++)
++
++logger = logging.getLogger("dinov3")
++
++CROP_SAMPLERS = ("uniform", "content", "motion")
++
++
++class CropSampler(Protocol):
++    def sample(self, image: "PILImage.Image", n: int, size: int, meta: dict):
++        """Returns (crops, positions): n PIL crops of (size,size) from image,
++        and their (top,left) positions in that (possibly pad_if_needed'd)
++        image. meta carries any per-sample side info a given sampler needs
++        (e.g. motion_energy_path). Positions are returned (not just crops) so
++        callers (e.g. augmentations.py's ibot_local masking) can pull the
++        SAME spatial region out of a co-registered signal (the motion-energy
++        map) for a chosen crop, without re-deriving where it came from."""
++        ...
++
++
++class UniformCropSampler:
++    """Byte-for-byte the pre-refactor local_crops_native=True behavior: plain
++    torchvision RandomCrop, pad_if_needed=True. MUST stay behaviorally identical
++    to that — it's the acceptance test for the whole CropSampler refactor (see
++    plan §6 W0: "loss curve identical to pre-refactor"). Deliberately left
++    UNCHANGED (not reimplemented to also recover positions, unlike the other two
++    arms below) to keep zero risk to that already-validated property; returns
++    positions=None, so ibot_local masking (dinov3/data/masking.py) just falls
++    back to plain (non-saliency-guided) random local masking for this arm --
++    same graceful-degradation philosophy used everywhere else in this module."""
++
++    def sample(self, image, n, size, meta):
++        from torchvision.transforms import v2
++        cropper = v2.RandomCrop(size, pad_if_needed=True)
++        return [cropper(image) for _ in range(n)], None
++
++
++class ContentCropSampler:
++    """Structure-tensor / top-hat content score (structure_score.py port) —
++    the pre-existing adaptive_crop.py behavior, now expressed via the shared
++    CropSampler interface. Same hard-timeout + uniform fallback as before."""
++
++    def __init__(self, temperature: float = 0.3):
++        self.temperature = temperature
++
++    def sample(self, image, n, size, meta):
++        image = pad_if_needed(image, size)
++        try:
++            with time_limit():
++                gray = np.array(image.convert("L"))
++                score = content_score(gray)
++                chosen = sample_positions_from_score(score, size, n, self.temperature)
++        except Exception as e:
++            logger.warning(f"[crop_sampler:content] scoring failed/timed out ({e}); "
++                            f"falling back to uniform random crop for this image")
++            chosen = uniform_positions(image, size, n)
++        return crop_at_positions(image, size, chosen), chosen
++
++
++class MotionCropSampler:
++    """Frame-difference motion-energy score (see scripts/12_motion_energy.py,
++    precomputed at extraction time — NOT at train time, which would stall the
++    single-GPU dataloader). meta['motion_energy_path'] must point at the
++    sidecar <frame>.me.png (grayscale, short side 96) for this image; if it's
++    missing/unreadable, falls back to uniform (same philosophy as
++    ContentCropSampler's fallback — a missing/bad motion map should never hang
++    or crash the run, just degrade to the uniform arm for that one image)."""
++
++    def __init__(self, temperature: float = 0.3):
++        self.temperature = temperature
++
++    def sample(self, image, n, size, meta):
++        me_path = meta.get("motion_energy_path")
++        image = pad_if_needed(image, size)
++        try:
++            if not me_path or not os.path.exists(me_path):
++                raise FileNotFoundError(f"no motion-energy map: {me_path}")
++            with time_limit():
++                w, h = image.size
++                me = PILImage.open(me_path).convert("L").resize((w, h), PILImage.BILINEAR)
++                score = np.asarray(me, dtype=np.float32)
++                # Match content_score's own convention (max-normalized to [0,1]) --
++                # the saved sidecar is an arbitrarily-scaled uint8 PNG, and
++                # self.temperature is calibrated against a [0,1] score; feeding it
++                # raw 0-255 values made softmax(score/temperature) nearly a hard
++                # argmax, breaking E1's "same sampling mechanic, only the score map
++                # differs" requirement (see module docstring).
++                denom = score.max()
++                if denom > 1e-6:
++                    score = score / denom
++                chosen = sample_positions_from_score(score, size, n, self.temperature)
++        except Exception as e:
++            logger.warning(f"[crop_sampler:motion] unavailable/failed ({e}); "
++                            f"falling back to uniform random crop for this image")
++            chosen = uniform_positions(image, size, n)
++        return crop_at_positions(image, size, chosen), chosen
++
++
++def build_crop_sampler(name: str, temperature: float = 0.3) -> CropSampler:
++    if name == "uniform":
++        return UniformCropSampler()
++    if name == "content":
++        return ContentCropSampler(temperature=temperature)
++    if name == "motion":
++        return MotionCropSampler(temperature=temperature)
++    raise ValueError(f"unknown crop sampler '{name}', expected one of {CROP_SAMPLERS}")
+diff --git a/dinov3/data/datasets/frames.py b/dinov3/data/datasets/frames.py
+new file mode 100644
+index 0000000..b0235bc
+--- /dev/null
++++ b/dinov3/data/datasets/frames.py
+@@ -0,0 +1,131 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# Custom dataset for domain-adaptive continued pretraining on extracted
++# microscopy frames (an ImageFolder-style tree of *.jpg). SSL: no real labels.
++#
++# Registered in loaders as:  Frames:root=/path/to/frames_hires/train
++
++import logging
++import os
++import random
++from typing import Any
++
++import numpy as np
++from PIL import ImageFile
++
++from .extended import ExtendedVisionDataset
++
++logger = logging.getLogger("dinov3")
++
++# tolerate slightly-truncated JPGs instead of crashing the whole run
++ImageFile.LOAD_TRUNCATED_IMAGES = True
++
++_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
++
++
++class Frames(ExtendedVisionDataset):
++    def __init__(
++        self,
++        *,
++        root: str,
++        extra: str = None,
++        split: str = None,
++        transforms=None,
++        transform=None,
++        target_transform=None,
++    ) -> None:
++        super().__init__(root=root, transforms=transforms,
++                         transform=transform, target_transform=target_transform)
++        self.samples = []
++        for dirpath, _, filenames in os.walk(root):
++            for fn in filenames:
++                # .me.png sidecars (scripts/12_motion_energy.py, consumed by
++                # MotionCropSampler) live in the SAME directories as the .jpg
++                # frames and end in ".png", which _EXTS also matches -- without
++                # this exclusion they get picked up as if they were training
++                # images (and, since PIL Image.filename then ends in ".me.png",
++                # MotionCropSampler's own sidecar-path lookup doubles the
++                # suffix to "....me.png.me.png" and never finds a real file).
++                if fn.lower().endswith(".me.png"):
++                    continue
++                if fn.lower().endswith(_EXTS):
++                    self.samples.append(os.path.join(dirpath, fn))
++        self.samples.sort()
++        if not self.samples:
++            raise RuntimeError(f"No images found under {root}")
++
++        # Temporal importance weighting (scripts/13_frame_weights.py) -- the
++        # crop_sampler axis (uniform/content/motion) only decides WHERE to
++        # crop within whatever frame gets picked; this is the complementary
++        # WHICH-frame-gets-picked axis. Opt-in via extra="weighted" (the
++        # `extra` param was otherwise unused) so any config that doesn't ask
++        # for it keeps exactly the old uniform-over-all-frames behavior --
++        # same fallback philosophy as crop_sampler's own missing-data path.
++        self._sample_probs = None
++        if extra == "weighted":
++            weights_path = os.path.join(root, "frame_weights.npy")
++            if not os.path.exists(weights_path):
++                logger.warning(f"extra='weighted' requested but {weights_path} "
++                                f"doesn't exist (run scripts/13_frame_weights.py first) "
++                                f"-- falling back to uniform sampling")
++            else:
++                weights = np.load(weights_path)
++                if len(weights) != len(self.samples):
++                    logger.warning(f"frame_weights.npy has {len(weights)} entries but "
++                                    f"{len(self.samples)} samples were found under {root} "
++                                    f"(sidecars generated/removed since the weights were "
++                                    f"computed?) -- falling back to uniform sampling")
++                else:
++                    self._sample_probs = weights / weights.sum()
++                    logger.info(f"loaded frame_weights.npy: temporal importance-weighted "
++                                f"sampling ENABLED ({len(weights)} frames, "
++                                f"max/median ratio={weights.max() / np.median(weights):.2f})")
++
++    def get_image_data(self, index: int) -> bytes:
++        with open(self.samples[index], "rb") as f:
++            return f.read()
++
++    def get_target(self, index: int) -> Any:
++        return 0  # SSL: dummy label
++
++    def __getitem__(self, index: int):
++        # A few extracted frames are corrupt/truncated; on any read/decode error
++        # retry with a random other sample so one bad file can't kill the run.
++        #
++        # Reimplements ExtendedVisionDataset.__getitem__ (rather than calling
++        # super()) so we can stamp `image.filename = <path>` BEFORE self.transforms
++        # runs -- MotionCropSampler (crop_sampler.py) needs the source path to
++        # find the sidecar <path>.me.png motion-energy map, and by the time
++        # super().__getitem__() would return, the transform has already run
++        # without knowing the path (PIL images decoded from bytes have no
++        # filename attribute; ExtendedVisionDataset only ever hands transforms
++        # the decoded image, never the path).
++        #
++        # Temporal importance weighting: when enabled, the incoming `index`
++        # (from dinov3/data/samplers.py's uniform-over-[0,N) infinite/epoch
++        # samplers, untouched -- see __init__) is treated only as "some call
++        # happened", then REPLACED by an independent weighted draw. This keeps
++        # every call an honest fresh sample from the target distribution
++        # (rather than a fixed index->index remap table, which would
++        # permanently strand ~37% of frames unreachable for the whole run --
++        # classic "balls into N bins" coverage loss for a single static
++        # weighted-with-replacement draw of size N).
++        if self._sample_probs is not None:
++            index = int(np.random.choice(len(self.samples), p=self._sample_probs))
++        for _ in range(20):
++            path = self.samples[index]
++            try:
++                image_data = self.get_image_data(index)
++                image = self.image_decoder(image_data).decode()
++                image.filename = path
++                target = self.get_target(index)
++                target = self.target_decoder(target).decode()
++                if self.transforms is not None:
++                    image, target = self.transforms(image, target)
++                return image, target
++            except Exception:
++                index = random.randint(0, len(self.samples) - 1)
++        raise RuntimeError("too many consecutive corrupt frames")
++
++    def __len__(self) -> int:
++        return len(self.samples)

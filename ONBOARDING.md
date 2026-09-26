@@ -100,12 +100,11 @@ SharedData01/stage1_out/dinov3_ckpt/  →  run_benchmark_*.py  →  report.html 
    - 处理组的 config 继承自 `motion`，没有时间加权，而且是在 GCP 上跑的：GCP 帧缓存的 sidecar 缺失比例比本地高（2026-09-22 的日志里有 15,749 次回退到 uniform）。
    - 对照组 `motion_weighted` 是在本地跑的，带时间加权。
    - 两组差了不止一个变量，所以"ibot_local 没用"这个结论也不成立。
-5. **benchmark 数据划分的问题**：
-   - 除 egg_in_well 外，所有检测数据集都没有独立的 test 文件夹。代码把 val 按文件名排序后一分为二，前半作 val、后半作 test（`stage1_out/benchmark/dataset/detect_ds.py:25-70`）。
-   - 按文件名排序会让 val 和 test 来自不同的拍摄 session。E1 里 val 和 test 分数差距大，很可能是这个原因（推断）。
-   - **egg_in_well**：val 前半的 10 张全是无标注背景图，所以 val mAP 恒为 -1（torchmetrics 在"没有 GT"时的返回值，`bench_run.log` 里的负 mAP 就是这么来的）。它自己的 5 张 test 图被忽略了。目标在原图 320×240 上约 13×12px，不到 1 个 patch token。
-   - **sperm_needle**：原图 2720×1536 缩到 320 后，needle_tip、sperm、meniscus 都只有约 5 到 10px。所有 ViT 都是 0，只有 ResNet50 在 finetune 下有 0.18（stride-4 特征）。这正好是 token 尺寸规律的又一个例子。它在 1024 分辨率下才有意义。
-   - `make_report.py` 已经把这两个数据集和 routine3_coc 剔除了（理由是"评测集少于 50 张"）。
+5. **benchmark 数据划分：2026-09-26 已修复，旧结果全部作废。**
+   - 旧代码把 val 按文件名排序后一分为二当 val/test，导致部分 val 集没有标注，并且 test 与 train 之间有大量近重复帧。例如 holding_pip test 有 72/131 张、routine2 test 有 92/127 张在 train 里有近重复图。
+   - 现在的切分单位是"录制 + 近重复帧连通分量"，按 70/15/15 分配，结果锁死在 benchmark 仓库的 `stage1_out/benchmark/dataset/split_lists/`。9 个数据集的跨 split 近重复都是 0。
+   - 规则写在 benchmark 仓库 `doc/CLAUDE.md` 的"契约修订 A1"里，审计过程见 `stage1_out/split_audit/REPORT.md`。
+   - **因此 `report.html` 和上面所有 E1 数字都基于旧划分，不能再引用，全部需要重跑。**
 
 **规则**：
 - **2 epoch 和 8 epoch 的 benchmark 结果不能直接比较。**
@@ -115,7 +114,7 @@ SharedData01/stage1_out/dinov3_ckpt/  →  run_benchmark_*.py  →  report.html 
 
 ## 5. 建议的下一步（按优先级）
 
-0. **先修 benchmark 的数据划分**：按 session 或视频分组切出固定的 val/test，而不是按文件名一分为二；egg_in_well 改用它自己的 test 文件夹；sperm_needle 改在 1024 分辨率下评估。修完之前，所有数字都只能算预实验。
+0. ~~先修 benchmark 的数据划分~~：已完成（2026-09-26）。下一步是在新划分上重跑全部 benchmark：所有 backbone × 数据集 × 协议 × 3 seed。
 1. **统一协议重跑 E1**：8 epoch 协议，uniform / content / motion / motion_weighted / cf-xattn 各跑 3 个 seed，只跑 holding_pip。先确定真实的排序。
    - 所有臂都在同一台机器上、用同一份帧缓存跑。`_gcp_dinov3_dapt.sh` 已修复，会保留 config 里的 `:extra=weighted`；修复之前，GCP 上跑 motion_weighted 会被静默降级成均匀抽帧。
 2. 把胜出的配置放到完整 benchmark 上验证（9 个数据集，frozen 加 finetune），不能只看 holding_pip。

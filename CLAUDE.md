@@ -29,7 +29,7 @@
   - 2 epoch 和 8 epoch 的 benchmark 结果**不可比**。
   - SESSION_NOTES §5.3 的"CoarseFineFPN 在 needle_tip 上翻盘"是跨协议比较；同协议的 plain FPN + motion_weighted 结果（§8.4，0.1047）反而更高。不要把它当成已确认的结论复述。
   - ibot_local 的 A/B 也被混淆了：处理组没有时间加权、跑在 GCP 上，对照组跑在本地。
-  - benchmark 的检测 test 集是把 val 按文件名排序后切出的后半部分（`detect_ds.py`），不是独立的 test 集。
+  - benchmark 在 2026-09-26 换成了锁死的分组划分（benchmark 仓库 `stage1_out/benchmark/dataset/split_lists/`，见其 `doc/CLAUDE.md` 契约修订 A1）。**此前的所有 benchmark 数字，包括 report.html 和 E1，都作废。**
 - 数据和权重都不在 git 里（`frames_hires/`、`weights/`、`gcp_outputs/`、`*_out/`、`manifests/`）。回答前先确认本机上是否存在。
 
 ## 硬约束

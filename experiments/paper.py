@@ -37,17 +37,19 @@ MAIN_ARM = "motion_weighted"                               # "ours"
 ABLATION_ARMS = ["uniform", "content", "motion", "motion_weighted"]
 APPENDIX_ARMS = ["motion_ibotlocal_high", "motion_ibotlocal_low"]
 MAIN_BACKBONES = ["resnet50_fpn", "dinov2_s_fpn", "dinov2_b_fpn", "biomedclip_fpn", "dinov3_b_fpn", "dinov3_dapt_b_fpn"]
-HIRES = dict(imgsz=1024, batch=8, protocol="frozen",
-             backbones=["resnet50_fpn", "dinov2_b_fpn", "dinov3_b_fpn", "dinov3_dapt_b_fpn"],
-             datasets=["holding_pip", "routine2_coc", "cvit_incubator", "cvit_workstation"])
+# main benchmark runs detection at 1024 px (contract amendment A2); E4 re-runs it at 320 px
+RES_ABL = dict(imgsz=320, protocol="frozen",
+               backbones=["resnet50_fpn", "dinov2_b_fpn", "dinov3_b_fpn", "dinov3_dapt_b_fpn"],
+               datasets=["holding_pip", "routine2_coc", "cvit_incubator", "cvit_workstation"])
 SEEDS = runner.SEEDS
 ALL_DATASETS = list(runner.TASK_CFG)                       # the runner always runs all 9 (DROP ones are reported excluded)
 DETECT_DATASETS = [d for d in ALL_DATASETS if d not in ("cellasp", "icsi_seg")]
-HIRES_DIR = BENCH / "stage1_out" / f"benchmark_results_hires{HIRES['imgsz']}"
+RES_ABL_DIR = BENCH / "stage1_out" / f"benchmark_results_imgsz{RES_ABL['imgsz']}"
 PATCH = 16
 
 # measured cost anchors (A100-40GB): e1 DAPT 3000 it @ batch16 = 51 min (1.0 s/it, gcp_outputs log 2026-09-22);
-# main benchmark 108 runs = 8.9 h (~5 min/run at 224/320 px, gcp_bench_outputs/bench_run.log)
+# main benchmark 108 runs = 8.9 h (~5 min/run at 224/320 px, gcp_bench_outputs/bench_run.log).
+# 1024-px detection runs are slower (not yet measured) -> estimates below are lower bounds.
 MIN_PER_BENCH_RUN_320 = 5.0
 
 
@@ -94,7 +96,7 @@ def to_posix(p: Path) -> str:
 def exp_status():
     """-> list of (id, title, done, total, [commands for what's missing], note)"""
     main_runs = runs_in(runner.OUTDIR)
-    hires_runs = runs_in(HIRES_DIR)
+    abl_runs = runs_in(RES_ABL_DIR)
     rows = []
 
     # E1 — DAPT pretraining of every arm at the same budget
@@ -126,9 +128,9 @@ def exp_status():
         done += n
         if n < len(ALL_DATASETS) * 2 * len(SEEDS):
             cmds.append(f"{env}python run_benchmark_server.py --all-seeds --backbone {bb} --skip-done")
-    rows.append(("E2", "main benchmark: 6 backbones x 9 datasets x 2 protocols x 3 seeds (320 px)", done, total,
-                 [f"cd {to_posix(BENCH)}"] + cmds if cmds else [],
-                 f"benchmark repo; ~{MIN_PER_BENCH_RUN_320 * (total - done) / 60:.0f} GPU-h left"))
+    rows.append(("E2", "main benchmark: 6 backbones x 9 datasets x 2 protocols x 3 seeds (detect 1024 px)", done, total,
+                 [f"cd {to_posix(BENCH)}", "# measure one 1024-px detection run first"] + cmds if cmds else [],
+                 f"benchmark repo; >{MIN_PER_BENCH_RUN_320 * (total - done) / 60:.0f} GPU-h left (lower bound, 1024 px not measured)"))
 
     # E3 — DAPT-arm ablation, frozen (claim C2)
     per_arm = len(ALL_DATASETS) * len(SEEDS)
@@ -146,28 +148,26 @@ def exp_status():
     rows.append(("E3", f"ablation: DAPT arms x 9 datasets x frozen x 3 seeds", done, per_arm * len(ABLATION_ARMS),
                  [f"cd {to_posix(BENCH)}"] + cmds if cmds else [], "main-arm frozen runs are shared with E2"))
 
-    # E4 — resolution (claim C3)
-    per_bb = len(HIRES["datasets"]) * len(SEEDS)
+    # E4 — resolution (claim C3): the main table's detection runs again at 320 px
+    per_bb = len(RES_ABL["datasets"]) * len(SEEDS)
     done, cmds = 0, []
-    base = (f"python run_benchmark_hires_ablation.py --all-seeds --imgsz {HIRES['imgsz']} --batch-size {HIRES['batch']} "
-            f"--protocol {HIRES['protocol']} --dataset {' '.join(HIRES['datasets'])} --skip-done")
-    for bb in HIRES["backbones"]:
+    base = (f"python run_benchmark_hires_ablation.py --all-seeds --imgsz {RES_ABL['imgsz']} "
+            f"--protocol {RES_ABL['protocol']} --dataset {' '.join(RES_ABL['datasets'])} --skip-done")
+    for bb in RES_ABL["backbones"]:
         if bb == "dinov3_dapt_b_fpn":
             if main_w is None:
                 cmds.append(f"# {bb}: waiting for E1 ({MAIN_ARM})")
                 continue
-            n = count(hires_runs, bb, sha256(main_w), protocols={"frozen"}, datasets=HIRES["datasets"])
+            n = count(abl_runs, bb, sha256(main_w), protocols={"frozen"}, datasets=RES_ABL["datasets"])
             env = f"DINOV3_DAPT_B_WEIGHTS={to_posix(main_w)} "
         else:
-            n = count(hires_runs, bb, protocols={"frozen"}, datasets=HIRES["datasets"])
+            n = count(abl_runs, bb, protocols={"frozen"}, datasets=RES_ABL["datasets"])
             env = ""
         done += n
         if n < per_bb:
             cmds.append(f"{env}{base} --backbone {bb}")
-    if cmds:
-        cmds.insert(0, "# measure one run first: 1024 px ViT attention is ~O(N^2) -> much slower than 320 px")
-    rows.append(("E4", f"resolution: 4 backbones x {len(HIRES['datasets'])} detect datasets x frozen x 3 seeds @ {HIRES['imgsz']} px",
-                 done, per_bb * len(HIRES["backbones"]),
+    rows.append(("E4", f"resolution ablation: 4 backbones x {len(RES_ABL['datasets'])} detect datasets x frozen x 3 seeds @ {RES_ABL['imgsz']} px",
+                 done, per_bb * len(RES_ABL["backbones"]),
                  [f"cd {to_posix(BENCH)}"] + cmds if cmds else [],
                  "+ `paper.py tokens` (local) + verify_v2_perclass_ap.py per run for per-class AP"))
 
@@ -303,19 +303,19 @@ def cmd_tables(_):
                 [agg[d][a].mean - agg[d]["uniform"].mean for d, _ in dss if a in agg[d] and "uniform" in agg[d]])
             for a in ABLATION_ARMS) + " |", ""]
 
-    # T3 resolution (C3): 320 vs 1024, frozen, detect datasets
-    hi = runs_in(HIRES_DIR)
+    # T3 resolution (C3): 320 px (E4 ablation) vs 1024 px (main table), frozen, detect datasets
+    abl = runs_in(RES_ABL_DIR)
     def res_key(r):
         if r.backbone == "dinov3_dapt_b_fpn":
             return "ours" if r.weights_sha256 == ours_sha else None
         return r.backbone
-    cols3 = [b if b != "dinov3_dapt_b_fpn" else "ours" for b in HIRES["backbones"]]
-    lo = _agg_by([r for r in main_runs if r.protocol == "frozen" and r.dataset in HIRES["datasets"] and res_key(r) in cols3], res_key)
-    hh = _agg_by([r for r in hi if r.protocol == "frozen" and r.dataset in HIRES["datasets"] and res_key(r) in cols3], res_key)
+    cols3 = [b if b != "dinov3_dapt_b_fpn" else "ours" for b in RES_ABL["backbones"]]
+    lo = _agg_by([r for r in abl if r.protocol == "frozen" and r.dataset in RES_ABL["datasets"] and res_key(r) in cols3], res_key)
+    hh = _agg_by([r for r in main_runs if r.protocol == "frozen" and r.dataset in RES_ABL["datasets"] and res_key(r) in cols3], res_key)
     md += ["### T3 — input resolution (frozen, detection mAP50): 320 px → 1024 px", "",
            "| dataset | " + " | ".join(rc.display_name(c) if c != "ours" else "ours" for c in cols3) + " |",
            "|---|" + "---|" * len(cols3)]
-    for ds in HIRES["datasets"]:
+    for ds in RES_ABL["datasets"]:
         cells = []
         for c in cols3:
             a, b = lo.get(ds, {}).get(c), hh.get(ds, {}).get(c)

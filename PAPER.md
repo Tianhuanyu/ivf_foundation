@@ -12,6 +12,7 @@
 
 | # | 主张 | 验证实验 | 产出 |
 |---|---|---|---|
+| **E0**（辅助） | 在**训练中没出现过的采集日、病例、会话**上测试，ViT 基础模型（原版 DINOv3、已交付的 DAPT 权重）相对 CNN 有没有优势。这个结果决定 E1–E4 值不值得跑 | **E0**：ResNet50、DINOv3-raw、DINOv3-DAPT（已有权重，uniform 采样，sha d7282330）× cellasp 加 4 个检测集 × frozen/finetune，单 seed，split profile `acquisition` | 表 T0 |
 | **C1** | 通用基础模型在 IVF 显微域不会自动胜出；在域内视频上做 DAPT 可以稳定提升 DINOv3，并缩小或反转它与 ImageNet CNN 的差距 | **E2** 主 benchmark：6 个 backbone × 9 个数据集 × frozen/finetune，单 seed 加 test 集 bootstrap 置信区间（契约修订 A3），锁定 split，检测用 1024 px（A2） | 表 T1 |
 | **C2**（方法） | 运动引导采样（空间 crop 加时间帧权重）优于均匀采样，也优于不用运动的显著性采样（content） | **E1** 在同一训练预算下训练 4 个 DAPT 臂，然后 **E3** 在所有数据集上跑 frozen（单 seed），用配对 bootstrap 和 uniform 比较 | 表 T2 |
 | **C3**（分析） | 小目标检测的瓶颈在 ViT 的 tokenization：目标短边不到 1–2 个 token 时，任何预训练改进都救不回来；把检测输入从 320 提到 1024 px，ViT 的收益明显大于 CNN | **E4** 把主表的检测降到 320 px 重跑（4 个 backbone × 4 个检测集 × frozen，单 seed），和主表的 1024 px 对比；加上 `tokens` 分析和逐类别 AP | 表 T3、表 tokens |
@@ -26,6 +27,24 @@
 - **时间**：`extra=weighted`。帧按运动分数的 p90 的 γ=0.4 次方加权抽取（`13_frame_weights.py`，参考 MGSampler）。
 - **对照臂**：`uniform` 是标准的域内继续预训练；`content` 是形态学加结构张量的显著性采样，用来回答"起作用的是运动，还是任何显著性都行"。
 - **一致性**：各臂只相差 `scripts/dapt_arms.sh` 里的覆盖项。已验证合并后的配置与原来的独立 yaml 逐项一致。
+
+## E0 的测试集设计（训练集和测试集差距更大）
+
+主 benchmark 的锁定 split（按录制）只保证 train 和 test 之间没有近乎相同的帧，但 test 的录制可能和 train 来自同一天、同一个病例。E0 改用 **`acquisition` split profile**：
+- **切分单位是采集批次**：同一采集日、同一病例或同一会话的录制归为一组，再合并近重复帧（`splits.acquisition_key`）。所以 test 来自训练中完全没见过的采集批次。
+- **跳过的数据集**：egg_in_well（2 天，其中一天占 94%）和 sperm_needle（3 天，其中一天占 97%）无法这样切。
+- **cellasp**：它的 train 会话和 val 会话本来就不相交（代码里有断言检查），所以 val/test 在那个没见过的会话内部按录制再切。
+
+**差距量化**：用 test 图到最近 train 图的 256-bit dHash 距离中位数来衡量，越大越不像。按录制切分对比按采集批次切分：
+- 变大：routine3 61 → 94，cvit_incubator 32 → 45，icsi_seg 66 → 72，routine2 43 → 46，cvit_workstation 56 → 59；
+- 不变：cellasp 65；
+- **变小：holding_pip 49 → 43。**
+
+切分时没有为了让差距变大去挑随机种子，那等于刻意挑难的 test 集，属于挑 split。这个 profile 保证的是采集批次互不相交，哈希距离只是一个粗略的外观指标，结果如实报告。
+
+**E0 的判定**：
+- 1024 px 下，DAPT（或原版 DINOv3）相对 CNN 的配对 Δ 在多数检测集上 ≥ 0：ViT 路线成立，推进 E1–E4。
+- CNN 在多数检测集上置信区间明确领先：论文重心改为"基础模型在 IVF 显微域的局限，以及 token 尺寸规律"；或者改用 ConvNeXt 这类 CNN 基础模型。
 
 ## 预先登记的判定规则
 

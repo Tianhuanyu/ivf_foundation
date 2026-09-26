@@ -28,10 +28,18 @@ BENCH = Path(os.environ.get("BENCH_ROOT", _default_bench))
 sys.path.insert(0, str(BENCH / "stage1_out"))
 from benchmark import report_common as rc  # noqa: E402
 from benchmark import runner  # noqa: E402
+from benchmark.weights_id import weights_identity  # noqa: E402
 
 OUT = DT / "experiments" / "out"
 
 # ── the plan ─────────────────────────────────────────────────────────────────────────────────
+# E0 (auxiliary, answers "does a ViT foundation model beat a CNN here at all?" BEFORE spending on E1):
+# CNN vs raw DINOv3 vs the already-shipped DAPT checkpoint (uniform crops, 20k it; = DINOV3_DAPT_B_WEIGHTS
+# default, sha d7282330), evaluated on the "acquisition" split profile -- test images come from days /
+# patient cases / sessions never seen in training, so the train/test gap is deliberately larger.
+E0 = dict(split_profile="acquisition",
+          backbones=["resnet50_fpn", "dinov3_b_fpn", "dinov3_dapt_b_fpn"],
+          datasets=["cellasp", "holding_pip", "routine2_coc", "cvit_incubator", "cvit_workstation"])
 BUDGET = "long"                                            # every DAPT arm gets the SAME budget
 MAIN_ARM = "motion_weighted"                               # "ours"
 ABLATION_ARMS = ["uniform", "content", "motion", "motion_weighted"]
@@ -76,8 +84,9 @@ def sha256(p: Path) -> str:
     return _sha_cache[key]
 
 
-def runs_in(results_dir: Path):
-    return rc.load_runs(results_dir, include_drop=True, quiet=True) if results_dir.is_dir() else []
+def runs_in(results_dir: Path, split_profile: str = "recording"):
+    return (rc.load_runs(results_dir, include_drop=True, quiet=True, split_profile=split_profile)
+            if results_dir.is_dir() else [])
 
 
 def count(runs, backbone, sha=None, protocols=None, datasets=None):
@@ -98,6 +107,26 @@ def exp_status():
     main_runs = runs_in(runner.OUTDIR)
     abl_runs = runs_in(RES_ABL_DIR)
     rows = []
+
+    # E0 — auxiliary: is a ViT foundation model worth it vs a CNN? (held-out acquisition batches)
+    e0_runs = runs_in(runner.OUTDIR, E0["split_profile"])
+    shipped_path, shipped_sha = weights_identity("dinov3_dapt_b_fpn")
+    per_bb = len(E0["datasets"]) * 2 * len(SEEDS)
+    done, cmds = 0, []
+    base = (f"python run_benchmark_server.py --all-seeds --split-profile {E0['split_profile']} "
+            f"--dataset {' '.join(E0['datasets'])} --skip-done")
+    for bb in E0["backbones"]:
+        n = count([r for r in e0_runs if r.dataset in E0["datasets"]], bb,
+                  shipped_sha if bb == "dinov3_dapt_b_fpn" else None)
+        done += n
+        if n < per_bb:
+            env = f"DINOV3_DAPT_B_WEIGHTS={to_posix(Path(shipped_path))} " if bb == "dinov3_dapt_b_fpn" else ""
+            cmds.append(f"{env}{base} --backbone {bb}")
+    rows.append(("E0", f"auxiliary ViT-vs-CNN check on held-out days/cases: {len(E0['backbones'])} backbones x "
+                       f"{len(E0['datasets'])} datasets x 2 protocols (shipped DAPT weights {shipped_sha[:8]})",
+                 done, per_bb * len(E0["backbones"]),
+                 [f"cd {to_posix(BENCH)}", "# ~30 runs; measure one 1024-px detection run first"] + cmds if cmds else [],
+                 "no E1 needed; result decides whether E1-E4 are worth running (PAPER.md)"))
 
     # (single training seed + test-set bootstrap CIs -- contract amendment A3; SEEDS = runner.SEEDS = [42])
     # E1 — DAPT pretraining of every arm at the same budget
@@ -278,6 +307,23 @@ def cmd_tables(_):
         if r.backbone == "dinov3_dapt_b_fpn":
             return "ours" if r.weights_sha256 == ours_sha else None
         return r.backbone
+
+    # T0 auxiliary (E0): CNN vs ViT on held-out acquisition batches
+    _, shipped_sha = weights_identity("dinov3_dapt_b_fpn")
+    e0 = [r for r in runs_in(runner.OUTDIR, E0["split_profile"]) if r.dataset in E0["datasets"] and r.seed in SEEDS]
+    e0_key = lambda r: ("dapt" if r.weights_sha256 == shipped_sha else None) if r.backbone == "dinov3_dapt_b_fpn" else r.backbone
+    agg0, idx0 = rc.aggregate(e0, key=e0_key), rc.index_runs(e0, key=e0_key)
+    task0 = rc.task_of(e0)
+    cols0 = ["resnet50_fpn", "dinov3_b_fpn", "dapt"]
+    names0 = ["CNN (ResNet-50)", "DINOv3 (raw)", f"DINOv3-DAPT (shipped, {shipped_sha[:8]})"]
+    for proto in ("frozen", "finetune"):
+        dss = [(d, task0[d]) for d in rc.ordered_datasets(d for p, d in agg0 if p == proto)]
+        c_raw = {d: rc.compare(idx0, proto, d, "dinov3_b_fpn", "resnet50_fpn") for d, _ in dss}
+        c_dapt = {d: rc.compare(idx0, proto, d, "dapt", "resnet50_fpn") for d, _ in dss}
+        md += _table(agg0, proto, dss, cols0, names0 + ["raw − CNN"],
+                     f"T0 — auxiliary: ViT vs CNN on held-out days/cases (split profile `{E0['split_profile']}`), {proto}",
+                     extra=("DAPT − CNN", lambda d: f"{rc.fmt_delta(c_raw[d])} | {rc.fmt_delta(c_dapt[d])}"))
+        md += [f"DAPT vs CNN ({proto}): {_delta_summary(c_dapt.values())}; raw vs CNN: {_delta_summary(c_raw.values())}", ""]
 
     # T1 main (C1)
     cols = [b if b != "dinov3_dapt_b_fpn" else "ours" for b in MAIN_BACKBONES]

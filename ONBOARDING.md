@@ -2,6 +2,7 @@
 
 > 写给接手这个项目的人。读完这一份应该能知道：项目在做什么、代码在哪、哪些是活的、结论可信到什么程度、下一步做什么。
 > 细节以 [`README.md`](README.md)（操作手册）和 [`SESSION_NOTES_motion_energy_e1.md`](SESSION_NOTES_motion_energy_e1.md)（最新实验记录）为准。
+> **论文主线和验证实验**：[`PAPER.md`](PAPER.md) 加 [`experiments/paper.py`](experiments/paper.py)。先跑 `python experiments/paper.py status` 看进度。
 > 用 Claude Code 打开本仓库时，[`CLAUDE.md`](CLAUDE.md) 会自动加载，Claude 可以直接回答关于代码和结论的问题（见 §9）。
 
 ---

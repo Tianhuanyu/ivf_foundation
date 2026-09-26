@@ -7,6 +7,7 @@
 
 产出的 backbone 交给下游 benchmark（`D:\Conceivable-SharedData01-23Jun2026`）评估。
 
+- **论文主线、主张与验收标准**：[`PAPER.md`](PAPER.md)；实验进度、命令和出表：`python experiments/paper.py status|commands|tokens|tables`
 - 项目背景、结论可信度、下一步：[`ONBOARDING.md`](ONBOARDING.md)
 - 实验记录与结果表：[`SESSION_NOTES_motion_energy_e1.md`](SESSION_NOTES_motion_energy_e1.md)
 - 流水线地图与权重血缘：`D:\Conceivable-ML\README.md`、`WEIGHTS_REGISTRY.md`

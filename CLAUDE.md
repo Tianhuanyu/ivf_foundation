@@ -6,6 +6,7 @@
 在官方 DINOv3 ViT-B/16 上，用 IVF 显微视频抽帧做域自适应继续预训练（DAPT），产出本域的 foundation backbone。权重交给下游 benchmark（`D:\Conceivable-SharedData01-23Jun2026`）评估。
 
 ## 先读这些（按顺序）
+0. `PAPER.md`：论文主张、预先登记的判定规则；`experiments/paper.py` 负责进度、命令和出表。判定规则写在 PAPER.md 里，不要事后改。
 1. `ONBOARDING.md`：交接总览、结论可信度、下一步。
 2. `SESSION_NOTES_motion_energy_e1.md`：最新实验记录、结果表、复现命令（§7）。
 3. `README.md`：操作手册。§1/§1.1 是**已归档**路径，只作历史参考。

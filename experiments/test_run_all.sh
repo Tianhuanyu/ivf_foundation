@@ -96,4 +96,16 @@ echo "== 6. lock: a second copy refuses to run"
 ( exec 9> "$RUN_STATE/.lock"; flock 9; rc=$(RA); echo "$rc" > "$T/lockrc" )
 check "second instance exits 1" '[ "$(cat "$T/lockrc")" = 1 ] && grep -q "已经在运行" "$T/out.log"'
 
+echo "== 7. stop kills run_all and its children (the bench_gcp retry loop)"
+rm -f "$RUN_STATE"/e234.*; echo slowstart > "$FAKE/queue"
+cat >> "$RUN_ALL_MOCK" <<'MOCK'
+bench_start(){ bash -c 'sleep 300' ; }    # stands in for the zone-retry loop; a child process that must die too
+MOCK
+setsid bash "$DT/experiments/run_all.sh" > "$T/bg.log" 2>&1 &
+until [ -f "$RUN_STATE/run_all.pid" ] && pgrep -f "sleep 300" >/dev/null; do command sleep 0.2; done
+RA stop >/dev/null; command sleep 1
+check "stop reports and kills children" 'grep -q "已停止" "$T/out.log" && ! pgrep -f "sleep 300" >/dev/null && ! kill -0 "$(cat "$RUN_STATE/run_all.pid")" 2>/dev/null'
+RA stop >/dev/null
+check "stop when not running" 'grep -q "没有在运行" "$T/out.log"'
+
 echo "RESULT: $pass passed, $fail failed"; [ "$fail" = 0 ]

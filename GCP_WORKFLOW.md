@@ -11,7 +11,7 @@
 |---|---|
 | 本地冒烟 | ✅ 已完成（全部通过，见 `experiments/SMOKE_RESULTS.md`） |
 | 上传帧缓存 | ✅ 已完成：`gs://mlflow-artifacts-ai-a100/dapt/cache/frames_hires_parts/`，12 个 tar，868,310 帧 / 617,346 个运动图 |
-| **1. E0** | ⏭ **从这里开始** |
+| **1. E0** | ⏭ **从这里开始**：执行第一部分第 1 步（2026-09-27 第一次启动时 8 个 zone 都没有 A100，已停掉，还没建过 VM） |
 | 2. E1 训练 4 个 DAPT 臂 | E0 判定通过后再做 |
 | 3. E2 + E3 + E4 | E1 完成后再做 |
 | 4. 出表 | 最后 |
@@ -28,7 +28,7 @@
 - **VM 挂了**（flex-start 到时间、被抢占、任务失败）：自动删掉旧 VM，新建一台续跑，每步最多重试 6 次（`MAX_ATTEMPTS`）。
   - 训练：每 1000 个 iter 存一个断点，每 5 分钟同步到桶。新 VM 从最新断点继续，最多损失约 1000 个 iter。
   - benchmark：每 10 分钟把结果同步到桶。新 VM 先拉回已完成的 run，跳过它们，最多损失正在跑的那一个 run。
-- **A100 没货**：每 10 分钟自动再试所有 zone，直到抢到为止。
+- **A100 没货**：普通方式每 10 分钟自动再试所有 zone；flex-start 方式在 GCP 队列里排队等卡。
 - 不管成功还是失败，VM 最后都会自动关机，不会空烧钱。
 
 ## 0. 进入环境（每次开新终端都要做）
@@ -44,19 +44,26 @@ gcloud auth login
 ```bash
 gcloud config set project hidden-outrider-390502
 ```
+⚠️ 下面所有命令都要在训练仓库目录里执行。这一条**单独**粘贴，不要和后面的启动命令拼成一行（行尾的 `&` 会把整行都放到后台执行，`cd` 也在后台，你的终端就不会切换目录）：
 ```bash
-cd /mnt/d/Video/domain_transfer && mkdir -p run_state
+cd /mnt/d/Video/domain_transfer
+```
+```bash
+mkdir -p run_state
 ```
 
 ## 1. 启动（后台运行，关掉终端也不会停）
 ⚠️ 这一步会开始产生 GCP 费用，而且中间不会再问确认。
-```bash
-nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
-```
-如果想用 flex-start 排队（抢卡更快，推荐在经常没货的时候用）：
+
+**推荐：flex-start 排队。** 请求会排进 GCP 的队列，us-east1-b（和桶同地区）一有空闲 A100 就自动建 VM，比轮询更容易抢到，价格也更低：
 ```bash
 FLEX=1 ZONES=us-east1-b nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
 ```
+普通方式：依次试 8 个美国 zone，全部没货就每 10 分钟重试一轮：
+```bash
+nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
+```
+> flex-start 是否支持 a2-highgpu-1g，要第一次真正提交时才能确认。如果日志里报"不支持该机型"，按下面的"切换启动方式"改用普通方式。
 
 ## 2. 查看进度（随时可以看）
 ```bash
@@ -65,14 +72,36 @@ bash experiments/run_all.sh status
 ```bash
 tail -n 30 run_state/run_all.log
 ```
+确认脚本在运行（应该只有一行 `bash experiments/run_all.sh`）：
+```bash
+pgrep -af run_all.sh
+```
+日志里怎么看：
+- `第 N 轮所有 zone 都没有容量` → 暂时没有 A100，在自动重试，不用管。一直这样可以切换到 flex-start。
+- `SSH 就绪` → VM 已经建好，任务开始跑。
+- `<步骤>: 结果 = done` 然后 `✅ 完成` → 这一步成功。
+- `结果 = failed` 或 `结果 = lost` → VM 出了问题，脚本会自动新建 VM 续跑，不用管。
+- `!!` 开头 → 脚本停下来了，需要人工处理（见下面的"如果脚本报错停止了"）。
+
+## 停止脚本 / 切换启动方式（普通 ↔ flex-start）
+停止要用下面这条。**不要用 `pkill -f run_all.sh`**：它只会杀掉主脚本，正在重试 zone 的子进程还会继续跑，而且会一直占着锁，导致下次启动报"已经在运行"。
+```bash
+bash experiments/run_all.sh stop
+```
+- **还没建好 VM 时**（日志最后是 `没有容量` 或 `排队`，还没出现 `SSH 就绪`）：停掉再用第 1 步里另一种命令启动，不会丢任何东西。
+- **VM 已经在跑任务时**：停掉脚本不会影响 VM 上的任务。重新启动后，脚本会接着等这个任务，不会重复提交。
+- 用 flex-start 排队时停掉脚本，GCP 那边可能还留着排队中的实例。停掉之后查一下，有 `bench-a100` 或 `dapt-a100` 却不需要的话，就用第二部分里的 `down` 命令删掉：
+```bash
+gcloud compute instances list --filter="name~a100"
+```
 
 ## 3. E0 完成后：脚本会停下，等你判定
-⛔ 日志最后一行会出现 `GATE`。看 `experiments/out/tables.md` 里的 T0，按 PAPER.md 判定：ViT 在多数检测集上不输 CNN，才继续。决定继续就批准，然后再执行一次启动命令：
+⛔ 日志最后一行会出现 `GATE`。看 `experiments/out/tables.md` 里的 T0，按 PAPER.md 判定：ViT 在多数检测集上不输 CNN，才继续。决定继续就批准，然后再执行一次第 1 步的启动命令（用哪种方式都可以）：
 ```bash
 touch run_state/APPROVE_E1
 ```
 ```bash
-nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
+FLEX=1 ZONES=us-east1-b nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
 ```
 
 ## 4. 全部完成
@@ -82,7 +111,7 @@ nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
 - `bash experiments/run_all.sh status` 可以看到停在哪一步，`run_state/run_all.log` 里有原因。
 - 修好之后重新执行启动命令，会从停下的那一步继续。
 - 如果某一步已经重试 6 次都失败，先删掉 `run_state/<步骤名>.attempts` 来重置计数，再启动。
-- 脚本自带锁，重复启动会直接报"已经在运行"并退出。查看是否在跑：
+- 脚本自带锁，重复启动会直接报"已经在运行"并退出。如果确定没有在跑却还是报这个，先执行 `bash experiments/run_all.sh stop`，再查一下是否还有残留进程：
 ```bash
 pgrep -af run_all.sh
 ```

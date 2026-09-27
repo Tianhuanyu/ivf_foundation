@@ -4,6 +4,7 @@
 #
 #   nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &     # start / resume (detached!)
 #   bash experiments/run_all.sh status                                         # what's done / running
+#   bash experiments/run_all.sh stop                                           # stop it (and its child processes)
 #   tail -f run_state/run_all.log                                              # live log
 #
 # Stages, in order (each one: start VM -> wait -> fetch -> delete VM -> verify):
@@ -140,8 +141,17 @@ status(){
   done
 }
 [ "${1:-}" = status ] && { status; exit 0; }
+if [ "${1:-}" = stop ]; then   # kill run_all AND its children (bench_gcp/dapt_train retry loops, gcloud) -- pkill -f run_all.sh alone leaves them
+  pid="$(cat "$STATE/run_all.pid" 2>/dev/null)"
+  ps -o args= -p "${pid:-0}" 2>/dev/null | grep -q run_all.sh || pid=""     # stale pid file / reused pid
+  pgid="$(ps -o pgid= -p "${pid:-0}" 2>/dev/null | tr -d ' ')"
+  if [ -z "$pgid" ]; then echo "run_all.sh 没有在运行"; exit 0; fi
+  kill -TERM -- "-$pgid" && echo "已停止 run_all.sh(进程组 $pgid)。VM 上已经在跑的任务不受影响;重新启动后会接着等它。"
+  exit 0
+fi
 exec 9> "$STATE/.lock"
 flock -n 9 || { echo "!! run_all.sh 已经在运行(pgrep -af run_all.sh 查看),不要同时开两个"; exit 1; }
+echo $$ > "$STATE/run_all.pid"
 
 log "===== run_all 开始 / 续跑(状态目录 $STATE)====="
 status

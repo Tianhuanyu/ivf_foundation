@@ -194,6 +194,18 @@ python experiments/paper.py tables
 
 ## 出问题时
 
+**A100 没货（报 `ZONE_RESOURCE_POOL_EXHAUSTED` / `STOCKOUT`）**：这是 GCP 暂时没有 GPU，不是配额问题（每个地区都有 16 张 A100 的配额）。
+- 脚本默认依次尝试这些 zone：us-east1-b（和桶同一地区）、us-central1-a/b/c/f、us-west1-b、us-west3-b、us-west4-b。
+- 在任意 `start` 命令前加 `RETRY_MIN=10`，全部没货时每 10 分钟自动再试一轮，直到抢到为止。例如：
+```bash
+RETRY_MIN=10 BENCH_CMD="bash paper_jobs.sh E0 smoke" ./bench_gcp.sh start
+```
+- 还可以扩到欧洲和亚洲。注意：从 us-east1 的桶往这些地区拉数据，会产生少量跨区流量费。
+```bash
+ZONES="europe-west4-a europe-west4-b asia-northeast1-a asia-northeast1-c" RETRY_MIN=10 BENCH_CMD="bash paper_jobs.sh E0 smoke" ./bench_gcp.sh start
+```
+
+
 查看当前有哪些实例：
 ```bash
 gcloud compute instances list

@@ -33,7 +33,7 @@ _dapt_budget_lines(){
   case "$1" in
     e1)   ;;                                                  # 6 x 500 = 3000 iters (yaml default)
     long) printf '%s\n' "train.OFFICIAL_EPOCH_LENGTH=2500" "optim.epochs=8" \
-                        "checkpointing.period=2500" "train.num_workers=8" ;;   # 8 x 2500 = 20000 iters
+                        "checkpointing.period=1000" "train.num_workers=8" ;;   # 8 x 2500 = 20000 iters; ckpt every 1000 (crash-safe resume, see _gcp_dinov3_dapt.sh)
     *) echo "!! unknown BUDGET '$1' (valid: $DAPT_BUDGETS)" >&2; return 1 ;;
   esac
 }

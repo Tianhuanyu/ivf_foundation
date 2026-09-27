@@ -3,11 +3,11 @@
 > 写给接手这个项目的人。读完这一份应该能知道：项目在做什么、已经做了哪些决定、代码在哪、下一步按什么顺序跑哪些脚本。
 > - **论文主线、主张、预先登记的判定规则**：[`PAPER.md`](PAPER.md)
 > - **实验进度、命令、出表**：`python experiments/paper.py status | commands | tokens | tables`
-> - **GCP 上的命令顺序（直接复制粘贴）**：[`GCP_WORKFLOW.md`](GCP_WORKFLOW.md)
+> - **GCP 上一键跑完全部实验（防崩溃、可续跑）**：`experiments/run_all.sh`，用法见 [`GCP_WORKFLOW.md`](GCP_WORKFLOW.md) 第一部分
 > - **操作手册**（环境、训练、GCP）：[`README.md`](README.md)
 > - 用 Claude Code 打开本仓库时，[`CLAUDE.md`](CLAUDE.md) 会自动加载，可以直接问 Claude（见 §9）。
 >
-> 最后更新：2026-09-26。
+> 最后更新：2026-09-27。
 
 ---
 
@@ -97,6 +97,8 @@ experiments/paper.py tables → experiments/out/tables.md（T0–T3）
 | `python experiments/paper.py commands [E0 E1 …]` | 列出还缺的部分该跑什么命令，按顺序；**只打印，不会执行** |
 | `python experiments/paper.py tokens` | 目标尺寸换算成 token 数的分析，本地几分钟 → `experiments/out/table_tokens.md` |
 | `python experiments/paper.py tables` | 用已有结果生成 T0–T3 表 → `experiments/out/tables.md` |
+| `bash experiments/run_all.sh status` | 一键脚本的进度：哪些步骤完成、哪一步在 VM 上跑、第几次尝试 |
+| `bash experiments/test_run_all.sh` | 用假的 GCP 测一键脚本的续跑、重试逻辑，不花钱，几秒钟 |
 
 **开跑前：冒烟测试**（每次改代码后、正式训练或上传前都跑一遍；最近一次结果见 [`experiments/SMOKE_RESULTS.md`](experiments/SMOKE_RESULTS.md)）
 

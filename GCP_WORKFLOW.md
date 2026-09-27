@@ -2,8 +2,7 @@
 
 > 位置：`D:\Video\domain_transfer\GCP_WORKFLOW.md`，WSL 里的路径是 `/mnt/d/Video/domain_transfer/GCP_WORKFLOW.md`。最后更新：2026-09-27。
 > - 全部在 **WSL** 里执行，从上往下一条一条粘贴。
-> - 🔁 表示这条要重复执行，直到出现注释里写的结果。
-> - ⛔ 表示先检查，符合条件再往下走。
+> - **推荐用第一部分的一键脚本**。第二部分是手动逐步执行的备用方式，两者做的事情完全一样。
 > - 实验设计和判定规则见 [PAPER.md](PAPER.md)。
 
 ## 当前进度
@@ -18,6 +17,82 @@
 | 4. 出表 | 最后 |
 
 ---
+
+# 第一部分：一键跑完（推荐）
+
+`experiments/run_all.sh` 按顺序跑完全部任务：E0 冒烟 → E0 → **暂停等你批准** → E1 冒烟 → 4 个臂（每个跑完自动交接权重）→ E2/E3/E4 冒烟 → E2/E3/E4 → 出表。
+每一步都是：建 VM → 等结果 → 取回 → 删 VM → 校验。
+
+**防崩溃机制：**
+- **本脚本挂了**（WSL 重启、关机、终端关了）：重新执行启动命令即可。已完成的步骤会跳过；正在 VM 上跑的任务不会重复提交，只是接着等它。
+- **VM 挂了**（flex-start 到时间、被抢占、任务失败）：自动删掉旧 VM，新建一台续跑，每步最多重试 6 次（`MAX_ATTEMPTS`）。
+  - 训练：每 1000 个 iter 存一个断点，每 5 分钟同步到桶。新 VM 从最新断点继续，最多损失约 1000 个 iter。
+  - benchmark：每 10 分钟把结果同步到桶。新 VM 先拉回已完成的 run，跳过它们，最多损失正在跑的那一个 run。
+- **A100 没货**：每 10 分钟自动再试所有 zone，直到抢到为止。
+- 不管成功还是失败，VM 最后都会自动关机，不会空烧钱。
+
+## 0. 进入环境（每次开新终端都要做）
+```bash
+wsl -d Ubuntu-24.04
+```
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate dapt
+```
+```bash
+gcloud auth login
+```
+```bash
+gcloud config set project hidden-outrider-390502
+```
+```bash
+cd /mnt/d/Video/domain_transfer && mkdir -p run_state
+```
+
+## 1. 启动（后台运行，关掉终端也不会停）
+⚠️ 这一步会开始产生 GCP 费用，而且中间不会再问确认。
+```bash
+nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
+```
+如果想用 flex-start 排队（抢卡更快，推荐在经常没货的时候用）：
+```bash
+FLEX=1 ZONES=us-east1-b nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
+```
+
+## 2. 查看进度（随时可以看）
+```bash
+bash experiments/run_all.sh status
+```
+```bash
+tail -n 30 run_state/run_all.log
+```
+
+## 3. E0 完成后：脚本会停下，等你判定
+⛔ 日志最后一行会出现 `GATE`。看 `experiments/out/tables.md` 里的 T0，按 PAPER.md 判定：ViT 在多数检测集上不输 CNN，才继续。决定继续就批准，然后再执行一次启动命令：
+```bash
+touch run_state/APPROVE_E1
+```
+```bash
+nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
+```
+
+## 4. 全部完成
+日志最后一行是 `全部完成`，结果在 `experiments/out/tables.md`，按 PAPER.md 的判定规则看 C1–C3。
+
+## 如果脚本报错停止了
+- `bash experiments/run_all.sh status` 可以看到停在哪一步，`run_state/run_all.log` 里有原因。
+- 修好之后重新执行启动命令，会从停下的那一步继续。
+- 如果某一步已经重试 6 次都失败，先删掉 `run_state/<步骤名>.attempts` 来重置计数，再启动。
+- 脚本自带锁，重复启动会直接报"已经在运行"并退出。查看是否在跑：
+```bash
+pgrep -af run_all.sh
+```
+
+---
+
+# 第二部分：手动逐步执行（备用）
+
+> 🔁 表示这条要重复执行，直到出现注释里写的结果。⛔ 表示先检查，符合条件再往下走。
+> 不要和 `run_all.sh` 同时用：两者用的是同一台 VM 和同一个桶路径。
 
 ## 0. 进入环境（每次开新终端都要做）
 ```bash

@@ -51,3 +51,4 @@ experiments/out/
 smoke_out/
 # per-stage frame-cache tars (scripts/upload_frame_cache.sh; deleted after upload)
 cache_parts/
+run_state/

@@ -20,7 +20,9 @@ DT_LOCAL="/mnt/d/Video/domain_transfer"
 
 LOG_TAG="${LOG_TAG:-gcp}"
 log(){ echo -e "\n\033[1;36m[$LOG_TAG] $*\033[0m"; }
-confirm(){ read -r -p "$1 [y/N] " a; [[ "$a" == "y" || "$a" == "Y" ]] || { echo "已取消"; exit 1; }; }
+confirm(){   # YES=1: non-interactive (experiments/run_all.sh) -- answers yes to create/delete prompts
+  if [ "${YES:-0}" = "1" ]; then echo "$1 [YES=1 -> y]"; return 0; fi
+  read -r -p "$1 [y/N] " a; [[ "$a" == "y" || "$a" == "Y" ]] || { echo "已取消"; exit 1; }; }
 
 preflight(){
   gcloud config set project "$PROJECT" >/dev/null 2>&1

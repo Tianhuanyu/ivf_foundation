@@ -49,3 +49,5 @@ __pycache__/
 experiments/out/
 # smoke-test outputs (scripts/dapt_run.sh SMOKE=1, experiments smoke runs)
 smoke_out/
+# per-stage frame-cache tars (scripts/upload_frame_cache.sh; deleted after upload)
+cache_parts/

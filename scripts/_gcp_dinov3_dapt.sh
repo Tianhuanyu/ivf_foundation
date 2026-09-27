@@ -27,10 +27,19 @@ dapt_overrides "$ARM" "$BUDGET" "$FRAMES" "$DT_ROOT/weights/$REPO_WEIGHTS" >/dev
 echo "===== [1/5] 拉权重 + 帧缓存(代码已由 cmd_pushcode 用 scp 送到 $DT_ROOT) ====="
 [ -d "$DT_ROOT/scripts" ] || { echo "!! $DT_ROOT/scripts 不存在——请先本地 ./scripts/dapt_train.sh pushcode"; exit 1; }
 gcloud storage rsync -r "$BUCKET/dapt/domain_transfer/weights" "$DT_ROOT/weights"
-# 帧缓存两种形式,优先目录:
-#   dapt/cache/frames_hires/train/   本地 frames_hires/train 直接 rsync 上去(含 .me.png 和 frame_weights.npy)
+# 帧缓存,按优先级:
+#   dapt/cache/frames_hires_parts/   upload_frame_cache.sh 按阶段打的 tar + frame_weights.npy + DONE.txt(清单)
+#   dapt/cache/frames_hires/train/   本地 frames_hires/train 直接 rsync 上去的目录
 #   dapt/cache/frames_hires.tar      dapt_prep.sh 在 CPU 机上从视频重新制作的打包缓存(备用)
-if gcloud storage ls "$BUCKET/dapt/cache/frames_hires/train/frame_weights.npy" >/dev/null 2>&1; then
+PARTS_URL="$BUCKET/dapt/cache/frames_hires_parts"
+EXPECT_JPG=""; EXPECT_ME=""
+if gcloud storage ls "$PARTS_URL/DONE.txt" >/dev/null 2>&1; then
+  mkdir -p "$FRAMES" /tmp/parts
+  gcloud storage cp "$PARTS_URL/*.tar" /tmp/parts/
+  for t in /tmp/parts/*.tar; do tar -C "$FRAMES" -xf "$t" && rm -f "$t"; done
+  gcloud storage cp "$PARTS_URL/frame_weights.npy" "$PARTS_URL/frame_weights_meta.json" "$FRAMES/"
+  read -r _ EXPECT_JPG EXPECT_ME < <(gcloud storage cat "$PARTS_URL/DONE.txt" | grep '^TOTAL')
+elif gcloud storage ls "$BUCKET/dapt/cache/frames_hires/train/frame_weights.npy" >/dev/null 2>&1; then
   mkdir -p "$FRAMES"
   gcloud storage rsync -r "$BUCKET/dapt/cache/frames_hires/train" "$FRAMES"
 elif gcloud storage ls "$BUCKET/dapt/cache/frames_hires.tar" >/dev/null 2>&1; then
@@ -42,6 +51,12 @@ fi
 
 N_JPG=$(find "$FRAMES" -name '*.jpg' | wc -l)
 echo "帧数: $N_JPG"
+if [ -n "$EXPECT_JPG" ]; then          # 按阶段打包的缓存:解包结果必须与清单一致
+  N_ME_ALL=$(find "$FRAMES" -name '*.me.png' | wc -l)
+  [ "$N_JPG" = "$EXPECT_JPG" ] && [ "$N_ME_ALL" = "$EXPECT_ME" ] \
+    || { echo "!! 帧缓存不完整:帧 $N_JPG/$EXPECT_JPG,运动图 $N_ME_ALL/$EXPECT_ME"; exit 1; }
+  echo "帧缓存与清单一致:$N_JPG 帧,$N_ME_ALL 运动图"
+fi
 if dapt_arm_needs_motion "$ARM"; then
   N_ME=$(find "$FRAMES" -name '*.me.png' | wc -l)
   echo "motion sidecar 覆盖: $N_ME / $N_JPG 帧"

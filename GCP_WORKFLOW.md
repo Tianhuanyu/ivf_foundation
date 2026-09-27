@@ -11,7 +11,7 @@
 |---|---|
 | 本地冒烟 | ✅ 已完成（全部通过，见 `experiments/SMOKE_RESULTS.md`） |
 | 上传帧缓存 | ✅ 已完成：`gs://mlflow-artifacts-ai-a100/dapt/cache/frames_hires_parts/`，12 个 tar，868,310 帧 / 617,346 个运动图 |
-| **1. E0** | ⏭ **从这里开始**：执行第一部分第 1 步（2026-09-27 第一次启动时 8 个 zone 都没有 A100，已停掉，还没建过 VM） |
+| **1. E0** | ⏳ 2026-09-28 已用 `run_all.sh`（FLEX=1）启动，VM 在 us-east1-b。用 `bash experiments/run_all.sh status` 看进度 |
 | 2. E1 训练 4 个 DAPT 臂 | E0 判定通过后再做 |
 | 3. E2 + E3 + E4 | E1 完成后再做 |
 | 4. 出表 | 最后 |
@@ -63,7 +63,7 @@ FLEX=1 ZONES=us-east1-b nohup setsid bash experiments/run_all.sh >> run_state/ru
 ```bash
 nohup setsid bash experiments/run_all.sh >> run_state/run_all.log 2>&1 &
 ```
-> flex-start 是否支持 a2-highgpu-1g，要第一次真正提交时才能确认。如果日志里报"不支持该机型"，按下面的"切换启动方式"改用普通方式。
+> ✅ 2026-09-28 已验证：flex-start 支持 a2-highgpu-1g。8 个 zone 都没货时，flex 在 us-east1-b 马上就建好了 VM。每次最多排队 2h（GCP 上限），没排到会自动重新排队。
 
 ## 2. 查看进度（随时可以看）
 ```bash
@@ -303,7 +303,7 @@ python experiments/paper.py tables
 
 **一直抢不到 A100：改用 flex-start 排队（推荐）**
 加上 `FLEX=1`，GCP 会把创建请求排进队列，等该 zone 有空闲 A100 时自动创建实例，不用我们反复轮询。
-- 最多排队 `FLEX_WAIT`（默认 6h）。
+- 每次最多排队 `FLEX_WAIT`（默认 2h，这是 GCP 允许的上限）。到时间还没排到，会过 `RETRY_MIN` 分钟后重新排队。
 - 实例最长运行 `FLEX_RUN`，到时间会被**自动删除**，所以一定要设得比任务时长大。结果在任务结束时已经回传到桶，自动删除不会丢数据。
 - 排队只在一个 zone 里进行，所以用 `ZONES` 指定和桶同地区的 us-east1-b。
 
@@ -315,7 +315,7 @@ E1 每个臂（估计 16–17 小时，设 36h），例如：
 ```bash
 FLEX=1 FLEX_RUN=36h ZONES=us-east1-b ARM=uniform BUDGET=long ./scripts/dapt_train.sh start
 ```
-> flex-start 是否支持 a2-highgpu-1g，要第一次真正提交时才能确认。如果报"不支持该机型"，就去掉 `FLEX=1`，回到 `RETRY_MIN=10` 的轮询方式。
+> ✅ 2026-09-28 已验证 flex-start 支持 a2-highgpu-1g。
 
 **已关机的实例重新开机失败（`instances start` 报 STOCKOUT）**：已关机的实例只能在原来的 zone 重新开机。先取回结果，再删掉旧实例，重新 `start` 就会在其他 zone 新建：
 ```bash

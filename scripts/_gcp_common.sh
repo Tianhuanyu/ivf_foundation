@@ -9,10 +9,10 @@ PROJECT="hidden-outrider-390502"            # Conceivable Cloud
 ZONES="${ZONES:-us-east1-b us-central1-a us-central1-b us-central1-c us-central1-f us-west1-b us-west3-b us-west4-b}"
 RETRY_MIN="${RETRY_MIN:-0}"   # >0: if every zone is sold out, wait this many minutes and try all zones again
 # FLEX=1: Dynamic Workload Scheduler "flex-start" -- instead of failing on STOCKOUT, GCP QUEUES the request
-#   and creates the VM once an A100 frees up in that zone (waits up to FLEX_WAIT, default 6h). The VM runs at
+#   and creates the VM once an A100 frees up in that zone (waits up to FLEX_WAIT, default 2h = the GCP maximum; with RETRY_MIN it re-queues). The VM runs at
 #   most FLEX_RUN (default 24h) and is then DELETED automatically -> set FLEX_RUN above the job's runtime.
 #   Results are uploaded to the bucket as soon as a job ends, so the forced deletion loses nothing.
-FLEX="${FLEX:-0}"; FLEX_WAIT="${FLEX_WAIT:-6h}"; FLEX_RUN="${FLEX_RUN:-24h}"
+FLEX="${FLEX:-0}"; FLEX_WAIT="${FLEX_WAIT:-2h}"; FLEX_RUN="${FLEX_RUN:-24h}"
 flex_args(){ [ "$FLEX" = "1" ] && printf '%s\n' --provisioning-model=FLEX_START --request-valid-for-duration="$FLEX_WAIT" \
                --max-run-duration="$FLEX_RUN" --instance-termination-action=DELETE --reservation-affinity=none; }
 BUCKET="gs://mlflow-artifacts-ai-a100"       # admin-created bucket (us-east1); our data lives under dapt/

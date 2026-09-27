@@ -8,6 +8,13 @@ PROJECT="hidden-outrider-390502"            # Conceivable Cloud
 # (fastest data, no cross-region egress). Override e.g. ZONES="europe-west4-a asia-northeast1-a" ...
 ZONES="${ZONES:-us-east1-b us-central1-a us-central1-b us-central1-c us-central1-f us-west1-b us-west3-b us-west4-b}"
 RETRY_MIN="${RETRY_MIN:-0}"   # >0: if every zone is sold out, wait this many minutes and try all zones again
+# FLEX=1: Dynamic Workload Scheduler "flex-start" -- instead of failing on STOCKOUT, GCP QUEUES the request
+#   and creates the VM once an A100 frees up in that zone (waits up to FLEX_WAIT, default 6h). The VM runs at
+#   most FLEX_RUN (default 24h) and is then DELETED automatically -> set FLEX_RUN above the job's runtime.
+#   Results are uploaded to the bucket as soon as a job ends, so the forced deletion loses nothing.
+FLEX="${FLEX:-0}"; FLEX_WAIT="${FLEX_WAIT:-6h}"; FLEX_RUN="${FLEX_RUN:-24h}"
+flex_args(){ [ "$FLEX" = "1" ] && printf '%s\n' --provisioning-model=FLEX_START --request-valid-for-duration="$FLEX_WAIT" \
+               --max-run-duration="$FLEX_RUN" --instance-termination-action=DELETE --reservation-affinity=none; }
 BUCKET="gs://mlflow-artifacts-ai-a100"       # admin-created bucket (us-east1); our data lives under dapt/
 DT_LOCAL="/mnt/d/Video/domain_transfer"
 
@@ -29,7 +36,8 @@ create_in_zones(){
   while true; do
     for z in $ZONES; do
       log "尝试在 $z 创建 $inst ..." >&2
-      if gcloud compute instances create "$inst" --project="$PROJECT" --zone="$z" "$@" >&2; then
+      [ "$FLEX" = "1" ] && log "flex-start:在 $z 排队等 A100(最多 $FLEX_WAIT;实例最长运行 $FLEX_RUN,到时自动删除)..." >&2
+      if gcloud compute instances create "$inst" --project="$PROJECT" --zone="$z" "$@" $(flex_args) >&2; then
         echo "$z"; return 0
       fi
       log "$z 无容量或创建失败,换下一个 zone ..." >&2

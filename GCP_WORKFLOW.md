@@ -197,6 +197,22 @@ python experiments/paper.py tables
 
 ## 出问题时
 
+**一直抢不到 A100：改用 flex-start 排队（推荐）**
+加上 `FLEX=1`，GCP 会把创建请求排进队列，等该 zone 有空闲 A100 时自动创建实例，不用我们反复轮询。
+- 最多排队 `FLEX_WAIT`（默认 6h）。
+- 实例最长运行 `FLEX_RUN`，到时间会被**自动删除**，所以一定要设得比任务时长大。结果在任务结束时已经回传到桶，自动删除不会丢数据。
+- 排队只在一个 zone 里进行，所以用 `ZONES` 指定和桶同地区的 us-east1-b。
+
+E0 正式运行（估计 15–30 小时，所以设 72h）：
+```bash
+FLEX=1 FLEX_RUN=72h ZONES=us-east1-b BENCH_CMD="bash paper_jobs.sh E0 run" ./bench_gcp.sh start
+```
+E1 每个臂（估计 16–17 小时，设 36h），例如：
+```bash
+FLEX=1 FLEX_RUN=36h ZONES=us-east1-b ARM=uniform BUDGET=long ./scripts/dapt_train.sh start
+```
+> flex-start 是否支持 a2-highgpu-1g，要第一次真正提交时才能确认。如果报"不支持该机型"，就去掉 `FLEX=1`，回到 `RETRY_MIN=10` 的轮询方式。
+
 **已关机的实例重新开机失败（`instances start` 报 STOCKOUT）**：已关机的实例只能在原来的 zone 重新开机。先取回结果，再删掉旧实例，重新 `start` 就会在其他 zone 新建：
 ```bash
 ./bench_gcp.sh fetch

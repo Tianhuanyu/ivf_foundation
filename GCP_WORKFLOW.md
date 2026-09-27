@@ -39,14 +39,15 @@ cd /mnt/d/Conceivable-SharedData01-23Jun2026
 ```
 先在 VM 上冒烟（会问是否创建实例，输入 `y`）：
 ```bash
-BENCH_CMD="bash paper_jobs.sh E0 smoke" ./bench_gcp.sh start
+RETRY_MIN=10 BENCH_CMD="bash paper_jobs.sh E0 smoke" ./bench_gcp.sh start
 ```
 🔁 直到出现 `BENCH DONE`：
 ```bash
 ./bench_gcp.sh status
 ```
+取回结果并删除实例（输入 `y`）。下一步 `start` 会在任意有货的 zone 新建实例：
 ```bash
-./bench_gcp.sh fetch
+./bench_gcp.sh finish
 ```
 ⛔ 应该是 `[PASS] …runs OK`，并且没有 OOM：
 ```bash
@@ -54,7 +55,7 @@ tail -n 5 stage1_out/gcp_bench_logs/bench_run.log
 ```
 正式运行：
 ```bash
-BENCH_CMD="bash paper_jobs.sh E0 run" ./bench_gcp.sh start
+RETRY_MIN=10 BENCH_CMD="bash paper_jobs.sh E0 run" ./bench_gcp.sh start
 ```
 🔁 直到出现 `BENCH DONE`：
 ```bash
@@ -75,14 +76,15 @@ cd /mnt/d/Video/domain_transfer
 ```
 先在 GCP 上冒烟（5 个 iter，会问是否创建实例，输入 `y`）：
 ```bash
-ARM=motion_weighted BUDGET=e1 DINO_EPOCH_LEN=5 DINO_EPOCHS=1 DINO_BATCH=8 ./scripts/dapt_train.sh start
+RETRY_MIN=10 ARM=motion_weighted BUDGET=e1 DINO_EPOCH_LEN=5 DINO_EPOCHS=1 DINO_BATCH=8 ./scripts/dapt_train.sh start
 ```
 🔁 直到出现 `DINOV3_DONE_motion_weighted_e1.txt`：
 ```bash
 ./scripts/dapt_train.sh status
 ```
+取回结果并删除实例（输入 `y`）：
 ```bash
-./scripts/dapt_train.sh fetch
+./scripts/dapt_train.sh finish
 ```
 ⛔ 应该能看到 `dinov3_vitb16_dapt_motion_weighted_e1_backbone.pth`：
 ```bash
@@ -91,7 +93,7 @@ ls -la gcp_outputs/
 
 ### 2a. uniform（约 16–17 小时）
 ```bash
-ARM=uniform BUDGET=long ./scripts/dapt_train.sh start
+RETRY_MIN=10 ARM=uniform BUDGET=long ./scripts/dapt_train.sh start
 ```
 🔁 直到出现 `DINOV3_DONE_uniform_long.txt`：
 ```bash
@@ -107,7 +109,7 @@ ARM=uniform BUDGET=long ./scripts/dapt_train.sh start
 
 ### 2b. content
 ```bash
-ARM=content BUDGET=long ./scripts/dapt_train.sh start
+RETRY_MIN=10 ARM=content BUDGET=long ./scripts/dapt_train.sh start
 ```
 🔁 直到出现 `DINOV3_DONE_content_long.txt`：
 ```bash
@@ -122,7 +124,7 @@ ARM=content BUDGET=long ./scripts/dapt_train.sh start
 
 ### 2c. motion
 ```bash
-ARM=motion BUDGET=long ./scripts/dapt_train.sh start
+RETRY_MIN=10 ARM=motion BUDGET=long ./scripts/dapt_train.sh start
 ```
 🔁 直到出现 `DINOV3_DONE_motion_long.txt`：
 ```bash
@@ -137,7 +139,7 @@ ARM=motion BUDGET=long ./scripts/dapt_train.sh start
 
 ### 2d. motion_weighted
 ```bash
-ARM=motion_weighted BUDGET=long ./scripts/dapt_train.sh start
+RETRY_MIN=10 ARM=motion_weighted BUDGET=long ./scripts/dapt_train.sh start
 ```
 🔁 直到出现 `DINOV3_DONE_motion_weighted_long.txt`：
 ```bash
@@ -156,14 +158,15 @@ cd /mnt/d/Conceivable-SharedData01-23Jun2026
 ```
 先在 VM 上冒烟：
 ```bash
-BENCH_CMD="bash paper_jobs.sh E2 smoke && bash paper_jobs.sh E3 smoke && bash paper_jobs.sh E4 smoke" ./bench_gcp.sh start
+RETRY_MIN=10 BENCH_CMD="bash paper_jobs.sh E2 smoke && bash paper_jobs.sh E3 smoke && bash paper_jobs.sh E4 smoke" ./bench_gcp.sh start
 ```
 🔁 直到出现 `BENCH DONE`：
 ```bash
 ./bench_gcp.sh status
 ```
+取回结果并删除实例（输入 `y`）。下一步 `start` 会在任意有货的 zone 新建实例：
 ```bash
-./bench_gcp.sh fetch
+./bench_gcp.sh finish
 ```
 ⛔ 应该是 `[PASS]`：
 ```bash
@@ -171,7 +174,7 @@ tail -n 5 stage1_out/gcp_bench_logs/bench_run.log
 ```
 正式运行（中断后重新执行同一条命令就会续跑）：
 ```bash
-BENCH_CMD="bash paper_jobs.sh E2 run && bash paper_jobs.sh E3 run && bash paper_jobs.sh E4 run" ./bench_gcp.sh start
+RETRY_MIN=10 BENCH_CMD="bash paper_jobs.sh E2 run && bash paper_jobs.sh E3 run && bash paper_jobs.sh E4 run" ./bench_gcp.sh start
 ```
 🔁 直到出现 `BENCH DONE`：
 ```bash
@@ -193,6 +196,15 @@ python experiments/paper.py tables
 ---
 
 ## 出问题时
+
+**已关机的实例重新开机失败（`instances start` 报 STOCKOUT）**：已关机的实例只能在原来的 zone 重新开机。先取回结果，再删掉旧实例，重新 `start` 就会在其他 zone 新建：
+```bash
+./bench_gcp.sh fetch
+```
+```bash
+./bench_gcp.sh down
+```
+训练这边同理：先 `./scripts/dapt_train.sh fetch`，再 `./scripts/dapt_train.sh down`。所以每个任务结束时都用 `finish`，不要把关机的实例留着。
 
 **A100 没货（报 `ZONE_RESOURCE_POOL_EXHAUSTED` / `STOCKOUT`）**：这是 GCP 暂时没有 GPU，不是配额问题（每个地区都有 16 张 A100 的配额）。
 - 脚本默认依次尝试这些 zone：us-east1-b（和桶同一地区）、us-central1-a/b/c/f、us-west1-b、us-west3-b、us-west4-b。

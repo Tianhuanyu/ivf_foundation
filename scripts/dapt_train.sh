@@ -68,7 +68,13 @@ cmd_up(){
     log "实例 $INSTANCE 已在运行(zone=$(get_zone)),跳过"; return
   elif [ -n "$st" ]; then
     log "实例 $INSTANCE 状态是 $st,执行 start ..."
-    gcloud compute instances start "$INSTANCE" --project="$PROJECT" --zone="$(get_zone)"
+    gcloud compute instances start "$INSTANCE" --project="$PROJECT" --zone="$(get_zone)" || {
+      echo ""
+      echo "!! 已关机的实例只能在原来的 zone($(get_zone))重新开机,那里现在没有 A100。"
+      echo "   先 ./scripts/dapt_train.sh fetch 取回结果,再删掉旧实例、在有货的 zone 新建:"
+      echo "     ./scripts/dapt_train.sh down"
+      echo "     RETRY_MIN=10 ARM=<臂> BUDGET=<e1|long> ./scripts/dapt_train.sh start"
+      exit 1; }
   else
     confirm "即将创建 $MACHINE (A100 40GB) 实例,会开始计费。继续?"
     local spot_args=(); [[ "$SPOT" == "true" ]] && spot_args=(--provisioning-model=SPOT --instance-termination-action=STOP)

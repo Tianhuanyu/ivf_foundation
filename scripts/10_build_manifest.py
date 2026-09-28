@@ -17,18 +17,9 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from _common import DT_ROOT, parse_stage
+
 VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv", ".webm"}
-
-
-def parse_stage(name: str) -> str:
-    """'20251120_163400_MI_Sperm_selImmo.avi' -> 'Sperm_selImmo'."""
-    stem = Path(name).stem
-    if "_MI_" in stem:
-        stage = stem.split("_MI_", 1)[1]
-    else:
-        stage = stem
-    stage = re.sub(r"[_\d]+$", "", stage)  # strip trailing digits/underscores
-    return stage or "UNKNOWN"
 
 
 def parse_date(path: Path) -> str:
@@ -44,7 +35,7 @@ def parse_date(path: Path) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/mnt/d/Video")
-    ap.add_argument("--out", default="/mnt/d/Video/domain_transfer/manifests")
+    ap.add_argument("--out", default=f"{DT_ROOT}/manifests")
     ap.add_argument("--val-dates", type=int, default=2,
                     help="number of most-recent dates held out for validation")
     args = ap.parse_args()

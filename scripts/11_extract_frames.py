@@ -11,16 +11,11 @@ already has frames are skipped, so it resumes cleanly.
 """
 import argparse
 import os
-import re
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-
-def parse_stage(name: str) -> str:
-    stem = Path(name).stem
-    stage = stem.split("_MI_", 1)[1] if "_MI_" in stem else stem
-    return re.sub(r"[_\d]+$", "", stage) or "UNKNOWN"
+from _common import DT_ROOT, parse_stage, read_manifest
 
 
 def probe_duration(video: str) -> float:
@@ -35,7 +30,7 @@ def probe_duration(video: str) -> float:
 
 
 def extract_one(video: str, out_root: str, split: str, fps: float, short: int,
-                quality: int, max_frames: int):
+                quality: int, max_frames: int, grayscale: bool = False):
     vp = Path(video)
     stage = parse_stage(vp.name)
     out_dir = Path(out_root) / split / stage
@@ -52,6 +47,8 @@ def extract_one(video: str, out_root: str, split: str, fps: float, short: int,
         if dur > 0:
             eff_fps = min(fps, max_frames / dur)
     vf = (f"fps={eff_fps},scale='if(gt(iw,ih),-2,{short})':'if(gt(iw,ih),{short},-2)'")
+    if grayscale:
+        vf += ",format=gray"
     cmd = ["ffmpeg", "-nostdin", "-v", "error", "-i", str(vp),
            "-vf", vf, "-q:v", str(quality), pattern]
     try:
@@ -66,26 +63,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True, help="train_videos.txt or val_videos.txt")
     ap.add_argument("--split", required=True, choices=["train", "val"])
-    ap.add_argument("--out", default="/mnt/d/Video/domain_transfer/frames")
+    ap.add_argument("--out", default=f"{DT_ROOT}/frames")
     ap.add_argument("--fps", type=float, default=1.0, help="frames sampled per second")
     ap.add_argument("--short", type=int, default=256, help="short-side resize (px)")
     ap.add_argument("--quality", type=int, default=3, help="ffmpeg -q:v (2=best..31)")
     ap.add_argument("--max-frames", type=int, default=60,
                     help="cap frames per video (evenly spread); 0 = no cap")
+    ap.add_argument("--grayscale", action="store_true",
+                    help="输出灰度 JPG(省磁盘;显微图本就灰度,细路 I-JEPA 用)")
     ap.add_argument("--workers", type=int, default=max(2, (os.cpu_count() or 4) - 2))
     ap.add_argument("--limit", type=int, default=0, help="only first N videos (smoke test)")
     args = ap.parse_args()
 
-    videos = [l.strip() for l in Path(args.manifest).read_text().splitlines() if l.strip()]
-    if args.limit:
-        videos = videos[: args.limit]
+    videos = read_manifest(args.manifest, args.limit)
     print(f"[{args.split}] {len(videos)} videos -> {args.out} "
           f"(fps={args.fps}, short={args.short}, workers={args.workers})")
 
     total_frames = ok = skipped = errors = 0
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         futs = [ex.submit(extract_one, v, args.out, args.split, args.fps,
-                          args.short, args.quality, args.max_frames) for v in videos]
+                          args.short, args.quality, args.max_frames, args.grayscale)
+                for v in videos]
         for i, fut in enumerate(as_completed(futs), 1):
             video, status, n = fut.result()
             if status == "ok":

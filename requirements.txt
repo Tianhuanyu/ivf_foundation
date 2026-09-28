@@ -1,20 +1,28 @@
-# Python deps for the domain-transfer pipeline.
-# NOTE: install torch/torchvision SEPARATELY with the CUDA build matching your GPU:
-#   Blackwell / RTX 50xx (local):  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-#   Ampere/Ada/Hopper (cloud VM):  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-# Then: pip install -r requirements.txt
+# Python deps for the DAPT pipeline (the ONE list: used by scripts/02_install_deps.sh locally and
+# scripts/_gcp_dinov3_dapt.sh on the GCP VM).
+# Install torch/torchvision SEPARATELY first (scripts/01_bootstrap_env.sh does it):
+#   Blackwell / RTX 50xx (local) needs the cu128 build.
 
-timm
-einops
-transformers>=4.56        # provides DINOv3 (DINOv3ViTModel) via AutoModel
-huggingface_hub
-safetensors
-decord                    # video frame reader for the V-JEPA2 clip dataset
-av
-opencv-python-headless
-pillow
-scikit-learn              # kNN / linear-probe evaluation
-umap-learn
-pandas
+# official DINOv3 trainer (repos/dinov3)
+omegaconf
+iopath
+submitit
+fvcore
+torchmetrics
+termcolor
+ftfy
+regex
+scikit-learn              # imported by dinov3.eval
+pandas                    # imported by dinov3.eval
 pyyaml
-tqdm
+
+# HF -> repo weight conversion (repos/dinov3/_convert_hf_to_repo.py) + gated weight download
+transformers>=4.56
+safetensors
+huggingface_hub
+
+# data prep: 12_motion_energy.py / 13_frame_weights.py (11_extract_frames.py uses system ffmpeg)
+opencv-python-headless
+numpy
+scipy
+pillow

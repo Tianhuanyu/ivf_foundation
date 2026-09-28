@@ -1,196 +1,125 @@
-# IVF 显微视频域迁移 — 训练操作指南
+# IVF 显微域 DINOv3 DAPT — 操作手册
 
-用 `D:\Video` 下 ~2925 段 IVF 显微操作视频，对 **DINOv3**(图像) 和 **V-JEPA2**(视频) 两个自监督
-backbone 做**域自适应继续预训练 (DAPT)**，产出适配本域的通用特征提取器。评估用文件名里的
-12 类操作阶段做 kNN / 线性探针，对比迁移前后特征质量。
+用 `D:\Video` 下约 2925 段 IVF 显微操作视频的抽帧，对官方 **DINOv3 ViT-B/16** 做**域自适应继续预训练（DAPT）**。
+训练时用视频的运动信号引导采样：
+- **空间**：local crop 裁在哪（`crop_sampler`）；
+- **时间**：哪一帧多看（帧权重）。
 
-> 环境/数据准备已完成（见文末「附录」）。日常只需看 **§0 → §1/§2 训练 → §3 评估**。
+产出的 backbone 交给下游 benchmark（`D:\Conceivable-SharedData01-23Jun2026`）评估。
+
+- **论文主线、主张与验收标准**：[`PAPER.md`](PAPER.md)；实验进度、命令和出表：`python experiments/paper.py status|commands|tokens|tables`
+- 项目背景、结论可信度、下一步：[`ONBOARDING.md`](ONBOARDING.md)
+- 实验记录与结果表：[`SESSION_NOTES_motion_energy_e1.md`](SESSION_NOTES_motion_energy_e1.md)
+- 流水线地图与权重血缘：`D:\Conceivable-ML\README.md`、`WEIGHTS_REGISTRY.md`
+- 旧路线（自研 DINO 脚本、V-JEPA2、I-JEPA、fold）的代码和旧版 README 都在 `legacy/` 与 git 历史 `271895c` 里，不再维护。
 
 ---
 
-## §0. 每次开始前：激活环境
+## 0. 环境
 
-在 WSL (Ubuntu-24.04) 里：
+WSL Ubuntu-24.04，用户空间 Miniconda，conda 环境 `dapt`。RTX 5070 Ti 12GB 是 Blackwell sm_120，**必须用 torch cu128**。
 
 ```bash
 source ~/miniconda3/etc/profile.d/conda.sh && conda activate dapt
 cd /mnt/d/Video/domain_transfer
 ```
 
-（提示符出现 `(dapt)` 即可。下面所有命令都假设已在此目录。）
-
-可选：另开一个终端实时看显存/利用率
+首次搭建环境（02 会装 `requirements.txt`、clone 官方 DINOv3 并打上我们的 patch）：
 ```bash
-watch -n 1 nvidia-smi
+bash scripts/01_bootstrap_env.sh
+bash scripts/02_install_deps.sh
 ```
+DINOv3 权重是 gated 的，需要先 `hf auth login`，再 `hf download facebook/dinov3-vitb16-pretrain-lvd1689m --local-dir weights/dinov3_vitb16`。之后用 `repos/dinov3/_convert_hf_to_repo.py` 转成 repo 格式的 `weights/dinov3_vitb16_repo.pth`。
 
----
-
-## §1. 训练 DINOv3（图像线）
-
-脚本 `scripts/40_dinov3_dapt.py`。DINO 自蒸馏（student + EMA teacher + multi-crop）。
-
-**① 先冒烟，确认管线跑通（几十秒）**
-```bash
-python scripts/40_dinov3_dapt.py --batch 16 --local-crops 6 --max-steps 8
-```
-看到 8 行 `step … loss=… vram_used=…` 且无报错即可。
-
-**② 正式训练（本地，ViT-S）——这是主命令**
-```bash
-python scripts/40_dinov3_dapt.py \
-    --weights weights/dinov3_vits16 \
-    --batch 32 --local-crops 6 --out-dim 16384 \
-    --lr 5e-4 --ema 0.996 \
-    --max-steps 5000 \
-    --save weights/dinov3_vits16_dapt
-```
-- 训练结束会把适配后的 backbone 存到 `weights/dinov3_vits16_dapt`（HF 格式，可直接 `AutoModel.from_pretrained` 加载）。
-- ViT-S 很省显存（batch 16 仅 ~2.7GB），**本地可放心把 `--batch` 加到 64**。
-
-**③ 换 ViT-B（本地显存仍够）**
-```bash
-python scripts/40_dinov3_dapt.py --weights weights/dinov3_vitb16 --batch 24 \
-    --max-steps 5000 --save weights/dinov3_vitb16_dapt
-```
-
-**关键参数**
-| 参数 | 含义 | 建议 |
-|---|---|---|
-| `--weights` | 初始/输入权重目录 | `weights/dinov3_vits16` 或 `_vitb16` |
-| `--batch` | 每步图像数（每图再扩成 2+local_crops 个 crop） | 本地 32–64 |
-| `--local-crops` | 局部小图数量 | 6（显存紧就调 4） |
-| `--out-dim` | DINO 原型数 | 本地 16384；远程可 65536 |
-| `--lr` | 学习率（DAPT 用小值） | 5e-4，效果不稳就降到 1e-4 |
-| `--ema` | teacher 动量 | 0.996 |
-| `--max-steps` | 训练步数 | 先 5000 看趋势，再决定加大 |
-| `--save` | 输出 backbone 目录 | 起个带 `_dapt` 的名字 |
-
----
-
-## §2. 训练 V-JEPA2（视频线）
-
-脚本 `scripts/30_vjepa2_dapt.py`。掩码隐空间预测，从官方完整 ckpt 续训（含 predictor/target_encoder）。
-
-**① 先冒烟（约 1 分钟）**
-```bash
-python scripts/30_vjepa2_dapt.py --frames 16 --batch 1 --accum 4 --max-steps 8
-```
-
-**② 正式训练（本地，ViT-L）——这是主命令**
-```bash
-python scripts/30_vjepa2_dapt.py \
-    --frames 16 --batch 1 --accum 8 \
-    --lr 1e-4 --ema 0.999 \
-    --max-steps 3000 \
-    --save weights/vjepa2_vitl_dapt.pt
-```
-- **本地安全档 `--frames 16 --batch 1`，显存峰值 ~10.5GB**（12GB 卡的上限附近）。若 OOM：先降 `--frames 8`。
-- `--accum` 是梯度累积：有效 batch = `batch × accum`（上例 = 8），不额外吃显存。
-- 存的是适配后的 `target_encoder`（`weights/vjepa2_vitl_dapt.pt`）。
-
-**关键参数**
-| 参数 | 含义 | 建议 |
-|---|---|---|
-| `--frames` | 每 clip 帧数 | 本地 16（OOM 降 8）；远程可 32/64 |
-| `--batch` | clip 数/步 | 本地 1 |
-| `--accum` | 梯度累积步数 | 8（有效 batch=8） |
-| `--stride` | 抽帧间隔 | 4 |
-| `--lr` / `--ema` | 学习率 / target 动量 | 1e-4 / 0.999 |
-| `--max-steps` | 训练步数 | 先 3000 |
-| `--save` | 输出 ckpt 路径 | `weights/vjepa2_vitl_dapt.pt` |
-
----
-
-## §3. 评估（迁移前 vs 迁移后）
-
-脚本 `scripts/50_eval_features.py`（目前支持 DINOv3 图像特征）。冻结 backbone 抽特征 →
-kNN + 线性探针，**按视频分组分层划分**（无帧泄漏、12 类齐全）。
+## 1. 数据准备（一次性，产物都不进 git）
 
 ```bash
-# 迁移前 baseline（原始权重）
-python scripts/50_eval_features.py --weights weights/dinov3_vits16
-# 迁移后（你 §1 训出来的）
-python scripts/50_eval_features.py --weights weights/dinov3_vits16_dapt
+python3 scripts/10_build_manifest.py --val-dates 2            # 清单、标签、按日期切分
+python  scripts/11_extract_frames.py --manifest manifests/train_videos.txt --split train   # → frames_hires/
 ```
-比较两次输出的 `linear_acc` / `knn_acc`。**已知 baseline（原始 ViT-S）：kNN 70.8% / 线性探针 75.4% @ 12 类**——DAPT 后应上升。
 
----
+motion-energy sidecar 和帧权重要在**原生 Windows** 上生成。WSL 下有问题，见 SESSION_NOTES §2.3。
+```
+C:\ProgramData\miniconda3\python.exe -u scripts\12_motion_energy.py --manifest manifests\train_videos.txt --split train --workers 4
+C:\ProgramData\miniconda3\python.exe -u scripts\13_frame_weights.py --frames-root frames_hires --split train
+```
 
-## §4. 长时间训练的小技巧
+- `12_motion_energy.py` 产出 `frames_hires/train/<stage>/<frame>.jpg.me.png`。
+- `13_frame_weights.py` 产出 `frames_hires/train/frame_weights.npy`。
+- 目前 sidecar 覆盖约 71% 的帧。缺 sidecar 的帧会自动回退到 uniform 裁剪。
 
-后台跑并把日志写文件（关掉终端也不断）：
+## 2. 训练（`repos/dinov3` 官方 trainer）
+
+`repos/dinov3` 是官方 clone 加我们的改动。改动的完整备份是 [`patches/dinov3_dapt.patch`](patches/dinov3_dapt.patch)。
+
+**改了 `repos/dinov3` 之后要重新生成 patch**，否则 GCP 上打的是旧版本：
 ```bash
-nohup python scripts/40_dinov3_dapt.py --batch 32 --max-steps 20000 \
-      --save weights/dinov3_vits16_dapt > logs/dino_run1.log 2>&1 &
-tail -f logs/dino_run1.log      # 实时看日志
+cd repos/dinov3
+(git diff; for f in $(git ls-files --others --exclude-standard | grep -v __pycache__); do git diff --no-index /dev/null "$f"; done) > ../../patches/dinov3_dapt.patch
 ```
-（先 `mkdir -p logs`。）
 
-- **想继续练 DINOv3**：把上一次 `--save` 出来的目录当作下一次的 `--weights` 即可。
-- 本地按你的习惯先小步数验证第一个 epoch 跑通，再放大 `--max-steps` / 搬远程。
+**只有一个 config**：`repos/dinov3/dinov3/configs/train/dapt_vitb16.yaml`。
+实验臂（ARM）和训练量（BUDGET）是命令行覆盖项，只在 [`scripts/dapt_arms.sh`](scripts/dapt_arms.sh) 里定义，本地和 GCP 共用这一份。所以各臂之间只差表里列出的那几行：
 
----
+| ARM | 相对 base 的改动 |
+|---|---|
+| `uniform` | 无（对照） |
+| `content` | `crops.crop_sampler=content`（形态学显著性） |
+| `motion` | `crops.crop_sampler=motion` |
+| `motion_weighted` | motion + 数据路径加 `:extra=weighted`（**主方法**） |
+| `motion_ibotlocal_{high,low}` | motion + `ibot_local.enabled=true`、`direction=mask_{high,low}_saliency`（附录） |
 
-## §5. 搬到远程放大（脚本全参数化，改数值即可）
+| BUDGET | 训练量 |
+|---|---|
+| `e1` | 6 × 500 = 3000 iter（E1 消融用） |
+| `long` | 8 × 2500 = 20000 iter（正式长程） |
 
-| | 本地(12GB) | 远程(大显存) |
-|---|---|---|
-| DINOv3 | ViT-S/B, batch 32, out-dim 16384 | ViT-L/H, batch 128+, out-dim 65536 |
-| V-JEPA2 | ViT-L, frames 16, batch 1 | frames 32/64, batch 4+ |
+> 2026-09-26 已验证：base + 覆盖项与原来 7 个独立 yaml 合并后的配置**逐项完全一致**。那 6 个 `dapt_vitb16_official_compare_*.yaml` 目前还留在目录里，已经没有用，可以手动删掉。
 
-远程唯一要重装的是环境（同 §附录，注意 GPU 架构对应的 CUDA 版本）；数据/脚本原样拷过去即可。
+本地训练（跑完自动抽出 backbone 到 `weights/dinov3_vitb16_dapt_<ARM>_<BUDGET>_backbone.pth`）：
+```bash
+ARM=motion_weighted BUDGET=e1 ./scripts/dapt_run.sh             # 可选 DINO_BATCH / RUN_TAG / EXTRA_OPTS
+```
 
----
+单独抽 backbone：
+```bash
+python repos/dinov3/_extract_dapt_backbone_param.py --ckpt-root <output_dir>/ckpt --out weights/<name>_backbone.pth
+```
 
-## 附录：一次性环境 & 数据准备（已完成，供复现/远程重建）
+## 3. GCP 训练（A100-40GB）
+
+在 WSL 的项目根目录下运行。GCP 项目是 `hidden-outrider-390502`，实例名 `dapt-a100`。账号相关的配置都在 `scripts/_gcp_common.sh`：
+```bash
+./scripts/dapt_prep.sh run                                        # 一次性：制作帧缓存（抽帧 + sidecar + 帧权重）
+ARM=motion_weighted BUDGET=long ./scripts/dapt_train.sh start     # upload + up + pushcode + train
+./scripts/dapt_train.sh status
+./scripts/dapt_train.sh finish                                    # fetch + 删实例
+```
+
+- **`ARM` 没有默认值**。不传会直接拒绝执行，这是故意的：以前有默认值时误跑过错误的实验，白烧过账单。`BUDGET` 默认是 `long`。
+- **超参**：`DINO_BATCH`（默认 48）、`DINO_EPOCH_LEN`、`DINO_EPOCHS`、`REPO_WEIGHTS` 可再覆盖。
+- **产物**：`gcp_outputs/dinov3_vitb16_dapt_<ARM>_<BUDGET>_backbone.pth`，每个 run 有自己的完成标记 `DINOV3_DONE_<ARM>_<BUDGET>.txt`。
+- **帧缓存**：由 `dapt_prep.sh` 在 CPU 机上制作，包含 `.me.png` 和 `frame_weights.npy`。motion 类的 ARM 在 sidecar 覆盖率低于 `MIN_SIDECAR_COVERAGE`（默认 0.65，本地实测约 0.71）时会直接报错退出；`motion_weighted` 缺少 `frame_weights.npy` 时也会直接报错。
+  - ⚠️ 桶里现有的缓存是 2026-09-26 之前做的，sidecar 不全。跑 motion 类 ARM 之前，先删掉 `gs://mlflow-artifacts-ai-a100/dapt/cache/frames_hires.tar`，再用 `dapt_prep.sh run` 重做。
+- **zone 会变**：A100 缺货时会自动换 zone，实际 zone 以 `.dapt_a100_zone` 为准。
+- **OS Login 用户会漂移**：可能是 `thy`，也可能是 `htian_conceivable_life`，两者 `$HOME` 独立。换了用户时，远端会重装环境，多花几分钟，不是错误。
+
+## 4. 交接权重 → benchmark
 
 ```bash
-bash scripts/01_bootstrap_env.sh      # Miniconda + conda env 'dapt' + torch cu128
-bash scripts/02_install_deps.sh       # timm/transformers/decord... + clone repos + V-JEPA2 权重
-python3 scripts/10_build_manifest.py --val-dates 2          # 清单+标签+切分
-python  scripts/11_extract_frames.py --manifest manifests/train_videos.txt --split train
-python  scripts/11_extract_frames.py --manifest manifests/val_videos.txt   --split val
+./scripts/ship_weights.sh <权重文件> <benchmark侧目标路径> "<产出方说明>" "<训练配置说明>"
 ```
-DINOv3 权重是 gated，需自行 `hf auth login` 后 `hf download facebook/dinov3-vits16-pretrain-lvd1689m --local-dir weights/dinov3_vits16`（vitb16 同理）。
+脚本会自动算 sha256、登记到 `D:\Conceivable-ML\WEIGHTS_REGISTRY.md` 并复制过去。**不要手动 `cp`。**
 
-**关键环境事实**：WSL Ubuntu-24.04；用户空间 Miniconda（sudo 需密码，故不用 apt）；
-RTX 5070 Ti / Blackwell **sm_120 必须用 torch cu128**；GPU 12GB。
+benchmark 的跑法见 benchmark 仓库的 `BENCHMARK_DINOV3.md`。**那个仓库的 git 由人工管理，Claude 不做任何 git 操作。**
 
-## 开发 / Git
+## 目录
 
-**VS Code**：用 **Remote - WSL** 打开 `/mnt/d/Video/domain_transfer`（不要开 `D:\Video`，里面有 116GB 原始视频）。解释器选 WSL 的 `dapt` conda 环境。`.vscode/settings.json` 已把 `frames/weights/repos/logs/manifests` 排除出索引。
-
-**依赖**：只有 **vjepa2** 是源码依赖（被 `30_*.py` import），作 git submodule 钉版本；DINOv3 走 pip 的 `transformers`（`repos/dinov3` 未使用，已 gitignore，可删）。
-
-**只追踪代码**，数据/权重/帧/日志/manifests 全部 gitignore（体积大或含机器本地绝对路径，靠脚本重建或 GCS 同步）。
-
-一次性初始化 git（在项目根，WSL 里执行）：
-```bash
-cd /mnt/d/Video/domain_transfer
-rm -rf repos/dinov3                      # 未使用
-rm -rf repos/vjepa2                      # 换成 submodule
-git init
-git submodule add https://github.com/facebookresearch/vjepa2 repos/vjepa2
-git add .gitignore requirements.txt README.md .vscode scripts .gitmodules repos/vjepa2
-git commit -m "Domain-transfer pipeline: DINOv3 + V-JEPA2 DAPT scripts"
 ```
-别人复现：`git clone --recursive <你的仓库>`，再按 §附录装环境/备数据。
-
-## 目录结构
+scripts/       01-02 环境 · 10-13 数据(+_common.py) · dapt_arms.sh 实验臂定义 · dapt_run.sh 本地训练
+               dapt_prep.sh+_gcp_prep.sh 帧缓存 · dapt_train.sh+_gcp_dinov3_dapt.sh GCP(+_gcp_common.sh) · ship_weights.sh
+patches/       dinov3_dapt.patch（repos/dinov3 改动的完整备份）
+repos/dinov3/  官方 trainer + 改动（自带 .git，本仓库 gitignore）
+legacy/        已归档代码与旧日志（gitignored）
+frames_hires/ weights/ gcp_outputs/ manifests/ *_out/   数据和产物（gitignored）
 ```
-domain_transfer/
-  scripts/  00_detect 01_bootstrap 02_install 10_manifest 11_frames
-            20_clip_dataset 30_vjepa2_dapt 40_dinov3_dapt 50_eval_features
-  manifests/  all_videos.csv train_videos.txt val_videos.txt label_stats.txt
-  frames/<split>/<stage>/*.jpg      抽出的帧(兼作 ImageFolder)
-  repos/{dinov3,vjepa2}/            官方代码
-  weights/  vjepa2_vitl.pt  dinov3_vits16/  dinov3_vitb16/  (+ *_dapt 输出)
-```
-
-## 状态
-- [x] 环境 / 清单 / 抽帧 / clip 数据集
-- [x] V-JEPA2 续训 (30) — 12GB 跑通, 峰值 10.5GB
-- [x] DINOv3 续训 (40) — 12GB 跑通, ViT-S 2.7GB
-- [x] 特征评估 (50) — baseline kNN 70.8% / 线性探针 75.4%
-- [ ] 跑完整 DAPT 并对比迁移前后

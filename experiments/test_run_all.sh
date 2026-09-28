@@ -16,6 +16,9 @@ gcloud(){
   case "$1 $2" in
     "storage ls") [ -f "$(_b "$3")" ] ;;
     "storage rm") shift 2; local u; for u in "$@"; do rm -f "$(_b "$u")"; done; return 0 ;;
+    "auth print-access-token")                     # $FAKE/authfail = n: the login is expired for the next n checks
+      local n; n="$(cat "$FAKE/authfail" 2>/dev/null || echo 0)"
+      [ "$n" -gt 0 ] && { echo $((n - 1)) > "$FAKE/authfail"; return 1; }; return 0 ;;
     *) return 0 ;;
   esac
 }
@@ -72,6 +75,7 @@ rc=$(RA)
 check "exit 0, everything done" '[ "$rc" = 0 ] && [ -f "$RUN_STATE/tables.done" ] && [ -f "$RUN_STATE/e234.done" ]'
 check "e1_uniform relaunched after FAILED" '[ "$(n_launch e1_uniform)" = 2 ] && [ "$(cat "$RUN_STATE/e1_uniform.attempts")" = 2 ]'
 check "e1_motion relaunched after VM loss" '[ "$(n_launch e1_motion)" = 2 ] && grep -q "e1_motion: 结果 = lost" "$T/out.log"'
+check "failed launch (STOCKOUT) does not count as an attempt" '[ "$(cat "$RUN_STATE/e234_smoke.attempts")" = 1 ]'
 check "STOCKOUT -> down + retry" '[ "$(n_launch e234_smoke)" = 2 ] && grep -q "dapt-a100 down\|bench-a100 down e234_smoke" "$FAKE/ops.log"'
 check "all 4 arms shipped, in order" '[ "$(grep ^ship "$FAKE/ops.log" | tr "\n" " ")" = "ship uniform ship content ship motion ship motion_weighted " ]'
 check "tables built" 'grep -q "python experiments/paper.py tables" "$FAKE/ops.log"'
@@ -87,6 +91,23 @@ echo "== 4. gives up after MAX_ATTEMPTS"
 rm -f "$RUN_STATE"/e234.*; rm -f "$FAKE/bucket"/*; : > "$FAKE/ops.log"; printf '%s\n' fail fail fail > "$FAKE/queue"
 rc=$(MAX_ATTEMPTS=2 RA)
 check "exit 1 after 2 attempts" '[ "$rc" = 1 ] && [ "$(n_launch e234)" = 2 ] && [ ! -f "$RUN_STATE/e234.done" ]'
+
+echo "== 4b. gcloud login expires while a job runs (2026-09-28 incident) -> pause, no false 'lost', no attempt used"
+rm -f "$RUN_STATE"/e234.*; rm -f "$FAKE/bucket"/*; : > "$FAKE/ops.log"; : > "$FAKE/queue"
+echo "2026-01-01 00:00:00 attempt 1" > "$RUN_STATE/e234.launched"; echo 1 > "$RUN_STATE/e234.attempts"
+echo "SLOW gs://mlflow-artifacts-ai-a100/bench/outputs_a1/DONE.txt" > "$FAKE/vm/bench-a100"; echo 5 > "$FAKE/authfail"
+rc=$(RA)
+check "waited for re-login, then done without relaunch" '[ "$rc" = 0 ] && [ -f "$RUN_STATE/e234.done" ] && [ "$(n_launch e234)" = 0 ] && ! grep -q "结果 = lost" "$T/out.log" && grep -q "登录已过期" "$T/out.log" && grep -q "登录已恢复" "$T/out.log"'
+
+echo "== 4c. login expired at launch time -> waits, then launches as attempt 1"
+rm -f "$RUN_STATE"/e234.*; rm -f "$FAKE/bucket"/*; : > "$FAKE/ops.log"; echo done > "$FAKE/queue"; echo 4 > "$FAKE/authfail"
+rc=$(RA)
+check "one launch, attempts = 1" '[ "$rc" = 0 ] && [ "$(n_launch e234)" = 1 ] && [ "$(cat "$RUN_STATE/e234.attempts")" = 1 ]'
+
+echo "== 4d. launches keep failing -> gives up after MAX_START_FAILS, attempts untouched"
+rm -f "$RUN_STATE"/e234.*; rm -f "$FAKE/bucket"/*; : > "$FAKE/ops.log"; printf '%s\n' stockout stockout stockout > "$FAKE/queue"
+rc=$(MAX_START_FAILS=3 RA)
+check "exit 1 after 3 failed launches, no attempt recorded" '[ "$rc" = 1 ] && [ "$(n_launch e234)" = 3 ] && [ ! -f "$RUN_STATE/e234.attempts" ]'
 
 echo "== 5. status"
 RA status >/dev/null

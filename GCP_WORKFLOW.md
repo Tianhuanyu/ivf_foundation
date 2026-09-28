@@ -107,6 +107,12 @@ FLEX=1 ZONES=us-east1-b nohup setsid bash experiments/run_all.sh >> run_state/ru
 ## 4. 全部完成
 日志最后一行是 `全部完成`，结果在 `experiments/out/tables.md`，按 PAPER.md 的判定规则看 C1–C3。
 
+## gcloud 登录过期（日志里出现 `!! gcloud 登录已过期`）
+公司账号每隔一段时间就要重新登录（2026-09-28 实际遇到，大约 1 天一次）。登录过期时脚本会**暂停等你**：不消耗重试次数，也不会误以为 VM 丢了。VM 上的任务照常在跑。重新登录后，脚本在 5 分钟内自动继续：
+```bash
+gcloud auth login
+```
+
 ## 如果脚本报错停止了
 - `bash experiments/run_all.sh status` 可以看到停在哪一步，`run_state/run_all.log` 里有原因。
 - 修好之后重新执行启动命令，会从停下的那一步继续。

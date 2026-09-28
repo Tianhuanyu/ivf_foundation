@@ -34,7 +34,8 @@ STATE="${RUN_STATE:-$DT/run_state}"; mkdir -p "$STATE"
 export PATH="$HOME/google-cloud-sdk/bin:$PATH"          # the WSL-native gcloud (the /mnt/c Windows one stalls)
 source "$HOME/miniconda3/etc/profile.d/conda.sh" && conda activate dapt
 export YES=1 RETRY_MIN="${RETRY_MIN:-10}"
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-6}"      # relaunches per stage (VM loss / job failure); a resumed job keeps its progress
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-6}"      # successful launches per stage (VM loss / job failure); a resumed job keeps its progress
+MAX_START_FAILS="${MAX_START_FAILS:-10}"   # failed launches in a row before giving up
 POLL_MIN="${POLL_MIN:-5}"
 BUCKET="gs://mlflow-artifacts-ai-a100"
 PROJECT="hidden-outrider-390502"
@@ -45,29 +46,44 @@ ARMS="uniform content motion motion_weighted"
 log(){ echo "[run_all $(date '+%F %T')] $*"; }
 is_done(){ [ -f "$STATE/$1.done" ]; }
 mark(){ echo "$(date '+%F %T') ${2:-}" > "$STATE/$1.$3"; }
-inst_status(){   # inst_status <instance> <zone-state-file> -> RUNNING / TERMINATED / ... / ABSENT
-  local z; z="$(cat "$2" 2>/dev/null)"
-  [ -n "$z" ] || { echo ABSENT; return; }
-  gcloud compute instances describe "$1" --zone="$z" --project="$PROJECT" --format='value(status)' 2>/dev/null || echo ABSENT
+# gcloud login can expire mid-run (org re-auth policy). Every gcloud error must NOT be read as "VM gone" /
+# "job failed": we pause until `gcloud auth login` is redone, without consuming attempts.
+gcloud_ok(){ gcloud auth print-access-token >/dev/null 2>&1; }
+wait_auth(){
+  gcloud_ok && return 0
+  log "!! gcloud 登录已过期 -> 请在 WSL 里执行: gcloud auth login   (脚本在等你,不消耗重试次数,VM 上的任务不受影响)"
+  until gcloud_ok; do sleep 300; done
+  log "gcloud 登录已恢复,继续"
+}
+inst_status(){   # inst_status <instance> -> RUNNING / TERMINATED / ... / ABSENT / UNKNOWN (gcloud error: never "lost")
+  local out
+  out="$(gcloud compute instances list --project="$PROJECT" --filter="name=$1" --format='value(status)' 2>/dev/null)" \
+    || { echo UNKNOWN; return; }
+  echo "${out:-ABSENT}"
 }
 
 # ── generic stage runner ───────────────────────────────────────────────────────────────────────
 # run_stage <stage> <start-fn> <finish-fn> <done-url> <failed-url> <instance> <zone-file> [verify-fn]
+# attempts = successful launches only; failed launches (STOCKOUT beyond RETRY_MIN, transient errors) retry
+# separately, up to MAX_START_FAILS in a row.
 run_stage(){
   local st="$1" start_fn="$2" finish_fn="$3" done_url="$4" failed_url="$5" inst="$6" zfile="$7" verify_fn="${8:-true}"
   is_done "$st" && { log "$st: 已完成,跳过"; return 0; }
-  local attempt; attempt="$(cat "$STATE/$st.attempts" 2>/dev/null || echo 0)"
+  local attempt fails=0; attempt="$(cat "$STATE/$st.attempts" 2>/dev/null || echo 0)"
   while true; do
     if [ ! -f "$STATE/$st.launched" ]; then
-      attempt=$((attempt + 1)); echo "$attempt" > "$STATE/$st.attempts"
-      [ "$attempt" -le "$MAX_ATTEMPTS" ] || { log "!! $st: 已尝试 $MAX_ATTEMPTS 次仍失败,停止。看 run_state/run_all.log 和 VM 日志"; return 1; }
-      [ "$attempt" -eq 1 ] && gcloud storage rm "$done_url" "$failed_url" >/dev/null 2>&1
-      log "$st: 启动(第 $attempt 次)"
+      [ "$attempt" -lt "$MAX_ATTEMPTS" ] || { log "!! $st: 已启动 $MAX_ATTEMPTS 次仍没成功,停止。看 run_state/run_all.log 和 VM 日志"; return 1; }
+      wait_auth
+      [ "$attempt" -eq 0 ] && gcloud storage rm "$done_url" "$failed_url" >/dev/null 2>&1
+      log "$st: 启动(第 $((attempt + 1)) 次)"
       if ! $start_fn; then
-        log "$st: 启动失败 -> 删除可能残留的旧实例后重试"
-        $finish_fn down >/dev/null 2>&1 || true
+        fails=$((fails + 1))
+        [ "$fails" -lt "$MAX_START_FAILS" ] || { log "!! $st: 连续 $fails 次启动失败,停止。看 run_state/run_all.log"; return 1; }
+        log "$st: 启动失败($fails/$MAX_START_FAILS)-> 删除可能残留的旧实例后重试"
+        wait_auth; $finish_fn down >/dev/null 2>&1 || true
         sleep 60; continue
       fi
+      fails=0; attempt=$((attempt + 1)); echo "$attempt" > "$STATE/$st.attempts"
       mark "$st" "attempt $attempt" launched
     else
       log "$st: 之前已启动,继续等待(第 $attempt 次)"
@@ -75,14 +91,15 @@ run_stage(){
     # wait for DONE / FAILED / VM loss
     local outcome=""
     while [ -z "$outcome" ]; do
+      wait_auth
       if gcloud storage ls "$done_url" >/dev/null 2>&1; then outcome=done
       elif gcloud storage ls "$failed_url" >/dev/null 2>&1; then outcome=failed
       else
-        case "$(inst_status "$inst" "$zfile")" in
-          ABSENT)                      outcome=lost ;;      # e.g. flex-start time limit deleted it
+        case "$(inst_status "$inst")" in
+          ABSENT)                      gcloud_ok && outcome=lost ;;   # e.g. flex-start time limit deleted it
           TERMINATED|STOPPED|SUSPENDED) sleep 120            # job may be writing its marker right before poweroff
-                                       gcloud storage ls "$done_url" >/dev/null 2>&1 || outcome=lost ;;
-          *) sleep $((POLL_MIN * 60)) ;;
+                                       gcloud_ok && ! gcloud storage ls "$done_url" >/dev/null 2>&1 && outcome=lost ;;
+          *) sleep $((POLL_MIN * 60)) ;;                      # RUNNING / PROVISIONING / UNKNOWN (gcloud error)
         esac
       fi
     done
@@ -93,6 +110,7 @@ run_stage(){
       log "!! $st: 结果校验没通过,停止(不自动重跑,需要人工看)"; return 1
     fi
     log "$st: 没有成功($outcome)-> 取回已有结果、删机,然后续跑"
+    wait_auth
     $finish_fn fetch >/dev/null 2>&1 || true
     $finish_fn down  >/dev/null 2>&1 || true
     gcloud storage rm "$failed_url" >/dev/null 2>&1

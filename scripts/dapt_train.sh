@@ -21,13 +21,13 @@ LOG_TAG="dapt_gcp"
 source "$(dirname "$0")/_gcp_common.sh"
 source "$(dirname "$0")/dapt_arms.sh"
 
-INSTANCE="dapt-a100"
+INSTANCE="${INSTANCE:-dapt-a100}"          # run_all.sh runs the 4 E1 arms in parallel as dapt-a100-<arm>
 MACHINE="a2-highgpu-1g"                     # 1x A100 40GB(us-central1 配额 limit=16)
 IMAGE_FAMILY="common-cu129-ubuntu-2204-nvidia-580"
 IMAGE_PROJECT="deeplearning-platform-release"
 BOOT_DISK_GB=300
 SPOT="false"                                # true => 抢占式(省~65%,可能被抢占)
-ZONE_STATE="$DT_LOCAL/.dapt_a100_zone"      # 实例实际所在 zone(缺货轮换后)
+ZONE_STATE="$DT_LOCAL/.${INSTANCE//-/_}_zone"   # 实例实际所在 zone(缺货轮换后);dapt-a100 -> .dapt_a100_zone
 REMOTE_SCRIPT="_gcp_dinov3_dapt.sh"
 
 get_zone(){ if [ -f "$ZONE_STATE" ]; then cat "$ZONE_STATE"; else echo "${ZONES%% *}"; fi; }
